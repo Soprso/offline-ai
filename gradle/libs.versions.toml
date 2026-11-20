@@ -1,0 +1,48 @@
+[versions]
+# --- Toolchain (frozen: verified compatible set, see TOOLCHAIN.md) ---
+agp = "9.2.1"
+kotlin = "2.2.21"
+# AGP 9 enables built-in Kotlin (no org.jetbrains.kotlin.android plugin).
+# AGP runtime KGP dependency is 2.2.10; our explicit Kotlin is 2.2.21 (>= 2.2.10).
+# KSP 2.3.10 documented range: KGP 2.2.10-2.3.x, AGP 8.12+, Gradle 9.x for AGP 9.
+ksp = "2.3.10"
+room = "2.7.2"
+
+# --- Compose ---
+composeBom = "2025.10.01"        # ui 1.9.4 / material3 1.4.0 / minCompileSdk 35
+
+# --- AndroidX (only what the app actually uses) ---
+coreKtx = "1.16.0"
+activityCompose = "1.10.1"
+lifecycle = "2.9.4"
+navigationCompose = "2.9.8"
+junit = "4.13.2"
+
+[libraries]
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycle" }
+androidx-lifecycle-viewmodel-compose = { group = "androidx.lifecycle", name = "lifecycle-viewmodel-compose", version.ref = "lifecycle" }
+androidx-navigation-compose = { group = "androidx.navigation", name = "navigation-compose", version.ref = "navigationCompose" }
+
+# Local JVM tests (pure Kotlin logic only; no Robolectric/emulator needed)
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+
+# Room (local conversation database)
+androidx-room-runtime = { group = "androidx.room", name = "room-runtime", version.ref = "room" }
+androidx-room-ktx = { group = "androidx.room", name = "room-ktx", version.ref = "room" }
+androidx-room-compiler = { group = "androidx.room", name = "room-compiler", version.ref = "room" }
+
+# Compose (versions come from the BOM only - no individual version pins)
+androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+androidx-compose-ui = { group = "androidx.compose.ui", name = "ui" }
+androidx-compose-ui-graphics = { group = "androidx.compose.ui", name = "ui-graphics" }
+androidx-compose-ui-tooling = { group = "androidx.compose.ui", name = "ui-tooling" }
+androidx-compose-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
+androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }
+room = { id = "androidx.room", version.ref = "room" }

@@ -1,0 +1,69 @@
+# Android Studio / Gradle local state
+.idea/
+*.iml
+.gradle/
+.kotlin/
+local.properties
+.externalNativeBuild/
+.cxx/
+captures/
+**/build/
+
+# Generated application artifacts
+*.apk
+*.aab
+*.apks
+*.app
+
+# Model binaries and download state. App models live in app-private device storage.
+*.gguf
+*.gguf.*
+*.part
+*.tmp
+
+# Secrets, signing material and certificates
+.env
+.env.*
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.p8
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+keystore.properties
+signing.properties
+
+# Logs, dumps and IDE/OS temp files
+*.log
+*.hprof
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Vendored llama.cpp: keep the pinned library source needed by CMake, but
+# exclude upstream git history, build output, sample model/vocab binaries,
+# docs, tests, tools and web UI. Directory-level ignores are used because the
+# upstream .gitignore files re-include some of these paths with "!".
+app/src/main/cpp/llama.cpp/.git/
+app/src/main/cpp/llama.cpp/build/
+app/src/main/cpp/llama.cpp/models/
+app/src/main/cpp/llama.cpp/docs/
+app/src/main/cpp/llama.cpp/ui/
+app/src/main/cpp/llama.cpp/tools/
+app/src/main/cpp/llama.cpp/tests/
+app/src/main/cpp/llama.cpp/examples/
+app/src/main/cpp/llama.cpp/benches/
+app/src/main/cpp/llama.cpp/pocs/
+app/src/main/cpp/llama.cpp/gguf-py/
+app/src/main/cpp/llama.cpp/conversion/
+app/src/main/cpp/llama.cpp/ci/
+app/src/main/cpp/llama.cpp/requirements/
+app/src/main/cpp/llama.cpp/skills/
+app/src/main/cpp/llama.cpp/media/
+app/src/main/cpp/llama.cpp/grammars/
+app/src/main/cpp/llama.cpp/scripts/
