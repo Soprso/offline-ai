@@ -9,6 +9,11 @@ import com.soprso.dhurandharai.database.Conversation
 import com.soprso.dhurandharai.database.Message
 import com.soprso.dhurandharai.inference.EngineState
 import com.soprso.dhurandharai.inference.ModelEngine
+import com.soprso.dhurandharai.safety.ContentSafety
+import com.soprso.dhurandharai.safety.ReportSubmitter
+import com.soprso.dhurandharai.safety.SafetyCategory
+import com.soprso.dhurandharai.safety.SafetyReportStore
+import com.soprso.dhurandharai.safety.SafetyVerdict
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -22,6 +27,13 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+sealed interface ReportSubmissionUiState {
+    data object Idle : ReportSubmissionUiState
+    data object Submitting : ReportSubmissionUiState
+    data class Success(val reference: String) : ReportSubmissionUiState
+    data class Failure(val reportId: String, val message: String) : ReportSubmissionUiState
+}
 
 /**
  * Chat state, persistence and generation.
@@ -84,12 +96,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _performanceSummary = MutableStateFlow<String?>(null)
     val performanceSummary: StateFlow<String?> = _performanceSummary.asStateFlow()
 
+    private val _reportSubmission = MutableStateFlow<ReportSubmissionUiState>(ReportSubmissionUiState.Idle)
+    val reportSubmission: StateFlow<ReportSubmissionUiState> = _reportSubmission.asStateFlow()
+
     fun clearError() {
         _error.value = null
     }
 
     fun clearPerformanceSummary() {
         _performanceSummary.value = null
+    }
+
+    fun clearReportSubmissionState() {
+        _reportSubmission.value = ReportSubmissionUiState.Idle
     }
 
     /** Opens an existing conversation (from History). */
@@ -110,9 +129,21 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun sendMessage(text: String): Boolean {
         val trimmed = text.trim()
-        if (trimmed.isEmpty() || !submissionGuard.tryAcquire()) return false
+        if (trimmed.isEmpty()) return false
         _error.value = null
         _performanceSummary.value = null
+
+        // Local, on-device input safeguard: a blocked prompt is never persisted
+        // or handed to the inference engine, and never acquires the submission
+        // guard (which is released only by the generation coroutine).
+        val promptVerdict = ContentSafety.screenPrompt(trimmed)
+        if (promptVerdict.blocked) {
+            _error.value = "SAFETY · ${promptVerdict.category?.label ?: "BLOCKED"} — " +
+                ContentSafety.PROMPT_REFUSAL
+            return false
+        }
+        if (!submissionGuard.tryAcquire()) return false
+
         _isGenerating.value = true
         viewModelScope.launch {
             try {
@@ -178,13 +209,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
         val collected = StringBuilder()
         var lastStreamEmitMs = 0L
+        var blockedCategory: SafetyCategory? = null
 
         val result = try {
             ModelEngine.generate(
                 modelName = modelName,
                 messages = flat.toTypedArray(),
-                onToken = { piece ->
+                onToken = onToken@{ piece ->
+                    if (blockedCategory != null) return@onToken
                     collected.append(piece)
+                    // Output safeguard: screen the accumulated reply as it
+                    // streams so unsafe text is stopped early and never saved.
+                    val verdict = ContentSafety.screenResponse(collected.toString())
+                    if (verdict.blocked) {
+                        blockedCategory = verdict.category
+                        _streamingText.value = null
+                        ModelEngine.cancel() // lock-free native cancel
+                        return@onToken
+                    }
                     val now = SystemClock.elapsedRealtime()
                     if (now - lastStreamEmitMs >= 60L || piece.contains('\n')) {
                         _streamingText.value = collected.toString()
@@ -202,7 +244,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             _performanceSummary.value = "perf · ${metrics.compactSummary()}$code"
         }
 
+        // Final check covers replies that produced no streamed tokens.
+        val outputVerdict = blockedCategory?.let { SafetyVerdict(true, it) }
+            ?: ContentSafety.screenResponse(result ?: collected.toString())
+
         when {
+            outputVerdict.blocked -> {
+                persistAssistant(conversationId, ContentSafety.RESPONSE_REFUSAL)
+                _error.value = "SAFETY · ${outputVerdict.category?.label ?: "BLOCKED"} — " +
+                    "reply blocked by the on-device filter. Nothing was uploaded."
+            }
             result != null && result.isNotEmpty() -> persistAssistant(conversationId, result)
             result != null -> persistAssistant(conversationId, collected.toString())
             else -> {
@@ -267,6 +318,63 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             db.conversationDao().delete(id) // messages cascade
         }
     }
+
+    /**
+     * Saves an AI response report locally and attempts explicit user-initiated
+     * submission to the Shadow Studio Labs backend. The report is always preserved
+     * on-device; it is marked SUBMITTED only after server confirmation.
+     */
+    fun submitReport(message: Message, category: String, details: String) {
+        viewModelScope.launch {
+            _reportSubmission.value = ReportSubmissionUiState.Submitting
+            val app = getApplication<Application>()
+            val report = SafetyReportStore.saveLocal(
+                context = app,
+                category = category,
+                modelName = currentModelName.value ?: "model",
+                appVersion = appVersionName(),
+                conversationId = message.conversationId,
+                details = details,
+                reportedContent = message.content,
+                queueForSubmission = true,
+            )
+            val result = ReportSubmitter.submit(app, report)
+            _reportSubmission.value = if (result.ok && result.reportReference != null) {
+                ReportSubmissionUiState.Success(result.reportReference)
+            } else {
+                ReportSubmissionUiState.Failure(
+                    reportId = report.id,
+                    message = result.error ?: "Could not submit report. It has been saved locally; you can retry.",
+                )
+            }
+        }
+    }
+
+    /** Retries a previously saved pending/failed report (manual, explicit). */
+    fun retryReport(reportId: String) {
+        viewModelScope.launch {
+            val app = getApplication<Application>()
+            val pending = SafetyReportStore.markPending(app, reportId) ?: run {
+                _reportSubmission.value = ReportSubmissionUiState.Failure(reportId, "Report not found.")
+                return@launch
+            }
+            _reportSubmission.value = ReportSubmissionUiState.Submitting
+            val result = ReportSubmitter.submit(app, pending)
+            _reportSubmission.value = if (result.ok && result.reportReference != null) {
+                ReportSubmissionUiState.Success(result.reportReference)
+            } else {
+                ReportSubmissionUiState.Failure(
+                    reportId = pending.id,
+                    message = result.error ?: "Could not submit report. It has been saved locally; you can retry.",
+                )
+            }
+        }
+    }
+
+    private fun appVersionName(): String = runCatching {
+        val app = getApplication<Application>()
+        app.packageManager.getPackageInfo(app.packageName, 0).versionName ?: ""
+    }.getOrDefault("")
 
     override fun onCleared() {
         // The model is owned by ModelEngine (app-scoped), not the ViewModel:

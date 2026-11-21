@@ -36,7 +36,15 @@ find_library(log-lib log)
 
 target_compile_features(offlineai PRIVATE cxx_std_17)
 target_compile_options(offlineai PRIVATE -fno-exceptions -fno-rtti -O3)
-target_link_options(offlineai PRIVATE -Wl,--gc-sections)
+# 16 KB page size compatibility (Google Play requirement, Nov 2025+).
+# NDK r27 LLD defaults to 4 KB max-page-size; set 16 KB explicitly so all
+# LOAD segments in the final shared library are 16 KB-aligned. This covers
+# code linked from static llama.cpp/ggml archives into this .so.
+target_link_options(offlineai PRIVATE
+    -Wl,--gc-sections
+    -Wl,-z,max-page-size=16384
+    -Wl,-z,common-page-size=16384
+)
 
 target_link_libraries(offlineai
     PRIVATE

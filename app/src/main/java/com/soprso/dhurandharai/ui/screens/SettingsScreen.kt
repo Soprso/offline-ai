@@ -26,6 +26,7 @@ import com.soprso.dhurandharai.inference.NativeBridge
 fun SettingsScreen(
     onBack: () -> Unit,
     onOpenGuide: () -> Unit,
+    onOpenSafety: () -> Unit,
 ) {
     val context = LocalContext.current
     val version = rememberAppVersion(context)
@@ -65,11 +66,19 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.labelMedium,
                 )
             }
+            TextButton(onClick = onOpenSafety) {
+                Text(
+                    "SAFETY & REPORTS  →",
+                    style = MaterialTheme.typography.labelMedium,
+                )
+            }
+            PrivacyPolicyLink()
             InfoRow("Version", version)
             InfoRow("Native", nativeStatus)
             InfoRow("ABI", "arm64-v8a")
             Text(
-                "No preferences yet. The guide explains models, context, history and privacy.",
+                "Safety & Reports shows local report records and submission status. " +
+                    "The guide explains models, context, history, privacy and reporting.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 8.dp),

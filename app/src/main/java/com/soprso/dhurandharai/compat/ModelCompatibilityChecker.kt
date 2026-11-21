@@ -28,6 +28,14 @@ data class MemoryBreakdown(
     val runtimeBytes: Long?,
     val inferenceBuffersBytes: Long?,
     val marginBytes: Long?,
+    val systemOverheadBytes: Long?,
+    /** Estimated peak memory for the inference working set (weights + KV + runtime + buffers + margin). */
+    val inferencePeakBytes: Long?,
+    /** Conservative estimated minimum system RAM for a potentially usable inference session. */
+    val minimumSystemRamBytes: Long?,
+    /** Conservative estimated system RAM for comfortable operating headroom. */
+    val recommendedSystemRamBytes: Long?,
+    /** Backward-compatible alias for [inferencePeakBytes]. */
     val totalBytes: Long?,
     val sourceLabel: String,
     val detail: String,
@@ -36,7 +44,10 @@ data class MemoryBreakdown(
 
 data class CompatibilityAssessment(
     val category: CompatibilityCategory,
+    /** Backward-compatible alias for [memory.minimumSystemRamBytes]. */
     val estimatedMemoryBytes: Long?,
+    val minimumSystemRamBytes: Long?,
+    val recommendedSystemRamBytes: Long?,
     val safeBudgetBytes: Long,
     val contextLength: Int,
     val reason: String,
@@ -50,26 +61,34 @@ data class CompatibilityAssessment(
 )
 
 /**
- * Model-specific memory estimate.
+ * Model-specific memory/RAM estimate (conservative where exact measurements are unavailable).
  *
  * Weights come from GGUF tensor descriptors when a file is available, otherwise
- * from the published file size as a documented upper bound. KV cache is derived
- * from layer count, KV heads, head size and context length; sliding-window
- * layouts use their real window where the architecture is known. Runtime and
- * compute buffers use the configured batch, micro-batch, thread count and model
- * dimensions. Anything that cannot be derived is reported as UNKNOWN rather
- * than given a confident number. Android memory pressure changes the safe
- * budget, never the model estimate.
+ * from the published file size as a documented upper bound (quantization is reflected
+ * in file/tensor size). KV cache is derived from layer count, KV heads, head size,
+ * context length and the configured F16 K/V cache; sliding-window layouts use their
+ * real window where the architecture is known. Runtime and compute buffers use the
+ * configured batch, micro-batch, thread count and model dimensions to approximate
+ * llama.cpp inference overhead. A conservative OS/app overhead reserve is included in
+ * minimum/recommended system RAM estimates. Anything that cannot be derived is reported
+ * as UNKNOWN rather than given a confident number. Android memory pressure changes the
+ * safe budget, never the model requirement estimates.
  */
 object ModelCompatibilityChecker {
 
     private const val MIB = 1024L * 1024L
+    private const val GIB = 1024L * 1024L * 1024L
     private const val N_BATCH = 512
     private const val N_UBATCH = 512
     private const val N_SEQ_MAX = 1
     private const val KV_ELEMENT_BYTES = 2 // native context uses F16 K and V
     private const val SAFETY_MARGIN_NUM = 25
     private const val SAFETY_MARGIN_DEN = 100
+    /** Conservative baseline for Android system + app/background overhead (estimate). */
+    private const val SYSTEM_OVERHEAD_BYTES = 1536L * MIB
+    /** Comfortable headroom factor applied to minimum system RAM (estimate). */
+    private const val RECOMMENDED_HEADROOM_NUM = 135
+    private const val RECOMMENDED_HEADROOM_DEN = 100
     private const val MIN_CONTEXT = 512
 
     private val CONTEXT_CHOICES = listOf(512, 1024, 2048, 4096, 8192)
@@ -184,7 +203,7 @@ object ModelCompatibilityChecker {
     }
 
     fun estimateMemoryBytes(model: CatalogModel, info: GgufInfo?, contextLength: Int): Long? =
-        memoryBreakdown(model, info, contextLength, DeviceProfile.estimateFallback()).totalBytes
+        memoryBreakdown(model, info, contextLength, DeviceProfile.estimateFallback()).minimumSystemRamBytes
 
     fun memoryBreakdown(
         model: CatalogModel,
@@ -203,15 +222,15 @@ object ModelCompatibilityChecker {
         val weightsSource = if (info?.hasTensorWeights == true) {
             "GGUF tensor descriptors (${info.tensorTypes.size} tensor types)"
         } else {
-            "published GGUF file size (upper bound)"
+            "published GGUF file size (upper bound, reflects quantization)"
         }
 
         val kv = info?.let { kvCacheBytes(it, context) }
         if (kv == null && info != null) {
-            notes += "KV cache dimensions are incomplete; total memory is UNKNOWN."
+            notes += "KV cache dimensions are incomplete; RAM estimates are UNKNOWN."
         }
         if (info == null) {
-            notes += "No GGUF metadata is available."
+            notes += "No GGUF metadata is available; RAM estimates are UNKNOWN."
         }
         notes.addAll(info?.notes.orEmpty())
 
@@ -219,18 +238,29 @@ object ModelCompatibilityChecker {
         val buffers = computeBufferBytes(info, context, device)
         val subtotal = safeSum(listOf(weights, kv, runtime, buffers))
         val margin = subtotal?.let { it * SAFETY_MARGIN_NUM / SAFETY_MARGIN_DEN }
-        val total = subtotal?.let { safeSum(listOf(it, margin)) }
+        val inferencePeak = subtotal?.let { safeSum(listOf(it, margin)) }
+        val systemOverhead = if (inferencePeak != null) SYSTEM_OVERHEAD_BYTES else null
+        val minimumSystemRam = if (inferencePeak != null && systemOverhead != null) {
+            safeSum(listOf(inferencePeak, systemOverhead))
+        } else null
+        val recommendedSystemRam = minimumSystemRam?.let {
+            it * RECOMMENDED_HEADROOM_NUM / RECOMMENDED_HEADROOM_DEN
+        }
+
+        if (minimumSystemRam != null) {
+            notes += "System RAM figures are conservative estimates (OS/app overhead and headroom included)."
+        }
 
         val source = if (info?.hasTensorWeights == true) {
-            "GGUF tensor descriptors + model-specific KV + configured runtime"
+            "GGUF tensor descriptors + model-specific KV/context + configured runtime + conservative system overhead (estimate)"
         } else {
-            "published file size (upper bound) + model-specific KV + configured runtime"
+            "published file size (upper bound) + model-specific KV/context + configured runtime + conservative system overhead (estimate)"
         }
-        val detail = if (kv != null) {
+        val detail = if (kv != null && minimumSystemRam != null) {
             "F16 KV cache at $context context; no GPU layers; ${device.primaryAbi} CPU backend. " +
-                "Adds a $SAFETY_MARGIN_NUM% safety margin."
+                "Includes inference margin ($SAFETY_MARGIN_NUM%), OS/app overhead estimate, and recommended headroom."
         } else {
-            info?.reason ?: "UNKNOWN: no GGUF metadata is available for this model."
+            info?.reason ?: "UNKNOWN: insufficient metadata for a reliable RAM estimate."
         }
 
         return MemoryBreakdown(
@@ -242,7 +272,11 @@ object ModelCompatibilityChecker {
             runtimeBytes = runtime,
             inferenceBuffersBytes = buffers,
             marginBytes = margin,
-            totalBytes = total,
+            systemOverheadBytes = systemOverhead,
+            inferencePeakBytes = inferencePeak,
+            minimumSystemRamBytes = minimumSystemRam,
+            recommendedSystemRamBytes = recommendedSystemRam,
+            totalBytes = inferencePeak,
             sourceLabel = source,
             detail = detail,
             notes = notes,
@@ -290,25 +324,33 @@ object ModelCompatibilityChecker {
             "${formatSize(device.availableMemoryBytes)} currently available"
         }
 
-        val memoryComplete = memory.totalBytes != null && memory.kvComplete && info != null
-        val memoryFits = memory.totalBytes != null && memory.totalBytes <= budget
-        val comfortable = memory.totalBytes != null && memory.totalBytes <= budget * 80 / 100
+        val inferencePeak = memory.inferencePeakBytes
+        val minimumRam = memory.minimumSystemRamBytes
+        val recommendedRam = memory.recommendedSystemRamBytes
+        val memoryComplete = inferencePeak != null && minimumRam != null && memory.kvComplete && info != null
+        val totalRam = device.totalMemoryBytes.takeIf { it > 0 }
+        val fitsSafeBudget = inferencePeak != null && inferencePeak <= budget
+        val fitsMinimumTotal = minimumRam != null && (totalRam == null || minimumRam <= totalRam)
+        val fitsRecommendedTotal = recommendedRam != null && (totalRam == null || recommendedRam <= totalRam)
+        val comfortableBudget = inferencePeak != null && inferencePeak <= budget * 80 / 100
 
         val category = when {
             architecture.first == CheckStatus.FAIL -> CompatibilityCategory.NOT_RECOMMENDED
             storage.first == CheckStatus.FAIL -> CompatibilityCategory.NOT_RECOMMENDED
-            device.lowMemory && memory.totalBytes == null -> CompatibilityCategory.UNKNOWN
+            device.lowMemory && inferencePeak == null -> CompatibilityCategory.UNKNOWN
             !memoryComplete -> CompatibilityCategory.UNKNOWN
-            !memoryFits -> CompatibilityCategory.NOT_RECOMMENDED
+            !fitsSafeBudget || !fitsMinimumTotal -> CompatibilityCategory.NOT_RECOMMENDED
             architecture.first == CheckStatus.UNKNOWN -> CompatibilityCategory.UNKNOWN
-            comfortable -> CompatibilityCategory.RECOMMENDED
-            else -> CompatibilityCategory.SUPPORTED
+            !fitsRecommendedTotal || !comfortableBudget -> CompatibilityCategory.SUPPORTED
+            else -> CompatibilityCategory.RECOMMENDED
         }
 
-        val memoryReason = if (memory.totalBytes == null) {
-            "Estimated runtime memory UNKNOWN: ${memory.detail}"
+        val memoryReason = if (minimumRam == null || recommendedRam == null || inferencePeak == null) {
+            "Estimated RAM requirements UNKNOWN: ${memory.detail}"
         } else {
-            "Estimated runtime memory: ${formatSize(memory.totalBytes)}. " +
+            "Minimum system RAM (estimate): ${formatSize(minimumRam)}. " +
+                "Recommended system RAM (estimate): ${formatSize(recommendedRam)}. " +
+                "Estimated inference peak: ${formatSize(inferencePeak)}. " +
                 "Current safe budget: ${formatSize(budget)}; $pressure."
         }
 
@@ -320,6 +362,11 @@ object ModelCompatibilityChecker {
                 CompatibilityCategory.UNKNOWN -> append("UNKNOWN compatibility. ")
             }
             append(memoryReason)
+            if (totalRam != null && minimumRam != null && minimumRam > totalRam) {
+                append(" Device total RAM is below the estimated minimum.")
+            } else if (totalRam != null && recommendedRam != null && recommendedRam > totalRam) {
+                append(" Device total RAM is below the recommended estimate.")
+            }
             if (architecture.first != CheckStatus.OK) {
                 append(' ').append(architecture.second)
             }
@@ -330,7 +377,9 @@ object ModelCompatibilityChecker {
 
         return CompatibilityAssessment(
             category = category,
-            estimatedMemoryBytes = memory.totalBytes,
+            estimatedMemoryBytes = minimumRam,
+            minimumSystemRamBytes = minimumRam,
+            recommendedSystemRamBytes = recommendedRam,
             safeBudgetBytes = budget,
             contextLength = context,
             reason = reason,
@@ -345,13 +394,15 @@ object ModelCompatibilityChecker {
     }
 
     /**
-     * Conservative safe budget: never larger than a fraction of total RAM or
-     * of memory currently available. Android can reclaim cached pages at any
-     * time, so available RAM is not treated as permanently usable.
+     * Conservative safe budget for the inference working set right now: never larger
+     * than a fraction of total RAM or of memory currently available. Android can
+     * reclaim cached pages at any time, so available RAM is not treated as permanently
+     * usable. This is a runtime budget, not a model's minimum/recommended system RAM.
      */
     fun safeBudgetBytes(device: DeviceProfile): Long {
         val total = device.totalMemoryBytes.coerceAtLeast(1L)
         val available = device.availableMemoryBytes.coerceAtLeast(0L)
+        if (total == 1L && available == 0L) return 0L
         val totalCap = total * 45 / 100
         val availableCap = available * 80 / 100
         var budget = min(totalCap, availableCap)
@@ -363,12 +414,14 @@ object ModelCompatibilityChecker {
         info?.architecture?.takeIf { it.isNotBlank() } ?: model.architecture
 
     private fun runtimeBytes(device: DeviceProfile): Long? {
-        val heapReserve = min(device.appMaxMemoryBytes.coerceAtLeast(0L), 96L * MIB)
+        val heapReserve = min(device.appMaxMemoryBytes.coerceAtLeast(0L), 128L * MIB)
+            .coerceAtLeast(96L * MIB)
         val nativeReserve = safeMultiply(device.nativeLibraryBytes.coerceAtLeast(0L), 2L)
-        return safeSum(listOf(heapReserve, nativeReserve))
+        val baseRuntime = 128L * MIB
+        return safeSum(listOf(baseRuntime, heapReserve, nativeReserve))
     }
 
-    /** Compute buffers scale with the configured micro-batch and model dimensions. */
+    /** Compute/inference buffers scale with configured batch sizes and model dimensions (conservative estimate). */
     private fun computeBufferBytes(info: GgufInfo?, context: Int, device: DeviceProfile): Long? {
         if (info == null) return null
         val embedding = info.embeddingLength?.toLong()
@@ -388,9 +441,11 @@ object ModelCompatibilityChecker {
         val threads = device.cpuCount.coerceIn(2, 8).toLong()
         val threadStacks = safeMultiply(threads, 2L * MIB)
         val batchFactor = max(1L, N_BATCH / N_UBATCH.toLong())
-        return safeSum(listOf(activation, attention, graph, threadStacks))?.let {
+        val estimated = safeSum(listOf(activation, attention, graph, threadStacks))?.let {
             safeMultiply(it, batchFactor)
         }
+        // Ensure a conservative baseline for llama.cpp/context/batching overhead when tensor counts are small/unknown.
+        return max(estimated ?: 0L, 128L * MIB)
     }
 
     private fun safeSum(values: List<Long?>): Long? = try {

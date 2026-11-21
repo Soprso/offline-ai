@@ -65,6 +65,7 @@ fun ModelLibraryScreen(
     var selectedId by remember { mutableStateOf<String?>(null) }
     var pendingLoad by remember { mutableStateOf<ModelUiItem?>(null) }
     var pendingDelete by remember { mutableStateOf<ModelUiItem?>(null) }
+    var pendingNotRecommendedDownload by remember { mutableStateOf<ModelUiItem?>(null) }
 
     val selected = items.firstOrNull { it.catalog.id == selectedId }
     val recommended = items.filter { it.recommended }
@@ -164,7 +165,13 @@ fun ModelLibraryScreen(
             device = device,
             canChange = canChange,
             onDismiss = { selectedId = null },
-            onDownload = { viewModel.download(selected) },
+            onDownload = {
+                if (selected.compatibility.category == CompatibilityCategory.NOT_RECOMMENDED) {
+                    pendingNotRecommendedDownload = selected
+                } else {
+                    viewModel.download(selected)
+                }
+            },
             onPause = { viewModel.pauseDownload(selected) },
             onResume = { viewModel.resumeDownload(selected) },
             onCancel = { viewModel.cancelDownload(selected); selectedId = null },
@@ -179,6 +186,17 @@ fun ModelLibraryScreen(
             onUnload = { viewModel.unloadModel() },
             onDelete = { pendingDelete = selected },
             onContextChange = { context -> viewModel.setContextLength(selected, context) },
+        )
+    }
+
+    pendingNotRecommendedDownload?.let { item ->
+        NotRecommendedDownloadDialog(
+            item = item,
+            onConfirm = {
+                viewModel.download(item)
+                pendingNotRecommendedDownload = null
+            },
+            onDismiss = { pendingNotRecommendedDownload = null },
         )
     }
 
@@ -412,24 +430,22 @@ private fun ModelRow(
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        Row(modifier = Modifier.fillMaxWidth()) {
+        Text(
+            "Download ${formatSize(model.fileSizeBytes)} · " +
+                "Min RAM ${ramLabel(item.compatibility.minimumSystemRamBytes)} · " +
+                "Rec RAM ${ramLabel(item.compatibility.recommendedSystemRamBytes)} · " +
+                compatibilityLabel(item.compatibility.category),
+            style = MaterialTheme.typography.labelSmall,
+            color = compatibilityColor(item.compatibility.category),
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (item.recommended) {
             Text(
-                "${formatSize(model.fileSizeBytes)} file · " +
-                    "${item.compatibility.estimatedMemoryBytes?.let { "~${formatSize(it)} RAM" } ?: "RAM UNKNOWN"} · " +
-                    compatibilityLabel(item.compatibility.category),
+                "★ PICK",
                 style = MaterialTheme.typography.labelSmall,
-                color = compatibilityColor(item.compatibility.category),
-                modifier = Modifier.weight(1f),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.primary,
             )
-            if (item.recommended) {
-                Text(
-                    "★ PICK",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-            }
         }
         if (showProgress && progress != null && progress.totalBytes > 0) {
             val fraction = (progress.downloadedBytes.toFloat() / progress.totalBytes).coerceIn(0f, 1f)
@@ -505,7 +521,9 @@ private fun ModelDetailSheet(
             DetailRow("PARAMETERS", model.parameterCount)
             DetailRow("ARCHITECTURE", item.info?.architecture ?: model.architecture)
             DetailRow("QUANTIZATION", model.quantization)
-            DetailRow("DOWNLOAD SIZE", formatSize(model.fileSizeBytes))
+            DetailRow("MODEL DOWNLOAD SIZE", formatSize(model.fileSizeBytes))
+            DetailRow("MINIMUM SYSTEM RAM", ramLabel(item.compatibility.minimumSystemRamBytes))
+            DetailRow("RECOMMENDED SYSTEM RAM", ramLabel(item.compatibility.recommendedSystemRamBytes))
             DetailRow("LICENSE", model.license)
 
             Text(
@@ -563,10 +581,13 @@ private fun ModelDetailSheet(
             )
             DetailRow("SAFETY MARGIN", memory.marginBytes?.let { "~${formatSize(it)}" } ?: "UNKNOWN")
             DetailRow(
-                "EST. PEAK",
-                memory.totalBytes?.let { "~${formatSize(it)}" } ?: "UNKNOWN",
+                "EST. INFERENCE PEAK",
+                memory.inferencePeakBytes?.let { "~${formatSize(it)}" } ?: "UNKNOWN",
                 valueColor = compatibilityColor(item.compatibility.category),
             )
+            DetailRow("OS/APP OVERHEAD (EST.)", memory.systemOverheadBytes?.let { "~${formatSize(it)}" } ?: "UNKNOWN")
+            DetailRow("MINIMUM SYSTEM RAM", ramLabel(item.compatibility.minimumSystemRamBytes))
+            DetailRow("RECOMMENDED SYSTEM RAM", ramLabel(item.compatibility.recommendedSystemRamBytes))
             DetailRow("TOTAL RAM", formatSize(device.totalMemoryBytes))
             DetailRow(
                 "AVAILABLE RAM",
@@ -578,7 +599,12 @@ private fun ModelDetailSheet(
                     MaterialTheme.colorScheme.onSurfaceVariant
                 },
             )
-            DetailRow("SAFE BUDGET", formatSize(item.compatibility.safeBudgetBytes))
+            DetailRow("SAFE BUDGET (INFERENCE)", formatSize(item.compatibility.safeBudgetBytes))
+            Text(
+                "Minimum RAM indicates the estimated amount for a potentially usable inference session (not model weights alone). Recommended RAM adds comfortable headroom.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             Text(
                 "${memory.detail} Source: ${memory.sourceLabel}.",
                 style = MaterialTheme.typography.labelSmall,
@@ -688,8 +714,7 @@ private fun ModelDetailSheet(
                     else -> {
                         SheetButton(
                             label = if (model.gated) "LICENSE REQUIRED" else "DOWNLOAD",
-                            enabled = canChange && !model.gated &&
-                                item.compatibility.category != CompatibilityCategory.NOT_RECOMMENDED,
+                            enabled = canChange && !model.gated,
                             onClick = onDownload,
                         )
                     }
@@ -697,6 +722,39 @@ private fun ModelDetailSheet(
             }
         }
     }
+}
+
+@Composable
+private fun NotRecommendedDownloadDialog(
+    item: ModelUiItem,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("HARDWARE COMPATIBILITY WARNING", style = MaterialTheme.typography.titleMedium) },
+        text = {
+            Text(
+                "This model is not recommended for your device based on its estimated hardware requirements.\n\n" +
+                    "Model download size: ${formatSize(item.catalog.fileSizeBytes)}\n" +
+                    "Minimum system RAM (estimate): ${ramLabel(item.compatibility.minimumSystemRamBytes)}\n" +
+                    "Recommended system RAM (estimate): ${ramLabel(item.compatibility.recommendedSystemRamBytes)}\n\n" +
+                    "Running this model may cause slow inference, excessive memory consumption, application instability, out-of-memory errors or device overheating.\n\n" +
+                    "Do you still want to download it?",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text("DOWNLOAD ANYWAY", style = MaterialTheme.typography.labelMedium)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("CANCEL", style = MaterialTheme.typography.labelMedium)
+            }
+        },
+    )
 }
 
 @Composable
@@ -724,6 +782,8 @@ private fun DetailRow(
         )
     }
 }
+
+private fun ramLabel(bytes: Long?): String = bytes?.let { "~${formatSize(it)} (est.)" } ?: "UNKNOWN"
 
 @Composable
 private fun SheetButton(

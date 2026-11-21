@@ -17,6 +17,7 @@ import com.soprso.dhurandharai.ui.screens.ChatScreen
 import com.soprso.dhurandharai.ui.screens.GuideScreen
 import com.soprso.dhurandharai.ui.screens.HistoryScreen
 import com.soprso.dhurandharai.ui.screens.ModelLibraryScreen
+import com.soprso.dhurandharai.ui.screens.SafetyScreen
 import com.soprso.dhurandharai.ui.screens.SettingsScreen
 import kotlinx.coroutines.launch
 
@@ -85,10 +86,14 @@ fun OfflineAiApp(navController: NavHostController) {
                 SettingsScreen(
                     onBack = { navController.popBackStack() },
                     onOpenGuide = { navController.navigate(Routes.GUIDE) },
+                    onOpenSafety = { navController.navigate(Routes.SAFETY) },
                 )
             }
             composable(Routes.GUIDE) {
                 GuideScreen(onBack = { navController.popBackStack() })
+            }
+            composable(Routes.SAFETY) {
+                SafetyScreen(onBack = { navController.popBackStack() })
             }
         }
     }

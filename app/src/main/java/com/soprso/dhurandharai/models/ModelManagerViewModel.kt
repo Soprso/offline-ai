@@ -220,10 +220,6 @@ class ModelManagerViewModel(application: Application) : AndroidViewModel(applica
             )
             return
         }
-        if (item.compatibility.category == CompatibilityCategory.NOT_RECOMMENDED) {
-            _action.value = ModelActionState(message = item.compatibility.reason, isError = true)
-            return
-        }
         _action.value = ModelActionState(message = "Downloading ${item.catalog.displayName}")
         ModelDownloadManager.start(item.catalog)
     }
@@ -265,7 +261,6 @@ class ModelManagerViewModel(application: Application) : AndroidViewModel(applica
                 installed = true,
             )
             if (
-                fresh.category == CompatibilityCategory.NOT_RECOMMENDED ||
                 fresh.architectureStatus == CheckStatus.FAIL ||
                 fresh.storageStatus == CheckStatus.FAIL
             ) {
@@ -274,7 +269,10 @@ class ModelManagerViewModel(application: Application) : AndroidViewModel(applica
             }
 
             val warnings = ArrayList<String>()
-            if (fresh.estimatedMemoryBytes == null) warnings += "memory estimate UNKNOWN"
+            if (fresh.category == CompatibilityCategory.NOT_RECOMMENDED) warnings += "not recommended for this device"
+            if (fresh.minimumSystemRamBytes == null || fresh.recommendedSystemRamBytes == null) {
+                warnings += "RAM estimate UNKNOWN"
+            }
             if (!fresh.memory.kvComplete) warnings += "KV layout UNKNOWN"
             if (freshDevice.lowMemory) warnings += "device memory pressure"
             if (fresh.architectureStatus == CheckStatus.UNKNOWN) warnings += "architecture unverified"

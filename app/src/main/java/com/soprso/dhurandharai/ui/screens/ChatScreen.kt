@@ -23,6 +23,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
@@ -43,11 +44,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import com.soprso.dhurandharai.chat.ChatViewModel
 import com.soprso.dhurandharai.chat.MessageCopyPayload
+import com.soprso.dhurandharai.chat.ReportSubmissionUiState
 import com.soprso.dhurandharai.database.Message
 import kotlinx.coroutines.delay
 
@@ -73,6 +74,7 @@ fun ChatScreen(
 ) {
     var input by remember { mutableStateOf("") }
     var elapsedSeconds by remember { mutableStateOf(0) }
+    var reportTarget by remember { mutableStateOf<Message?>(null) }
 
     val messages by viewModel.messages.collectAsState()
     val modelName by viewModel.currentModelName.collectAsState()
@@ -80,6 +82,7 @@ fun ChatScreen(
     val streamingText by viewModel.streamingText.collectAsState()
     val error by viewModel.error.collectAsState()
     val performanceSummary by viewModel.performanceSummary.collectAsState()
+    val reportSubmission by viewModel.reportSubmission.collectAsState()
 
     val listState = rememberLazyListState()
     val context = LocalContext.current
@@ -199,7 +202,11 @@ fun ChatScreen(
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
                     items(messages, key = { it.id }) { msg ->
-                        MessageRow(msg, onCopy = ::copyMessage)
+                        MessageRow(
+                            message = msg,
+                            onCopy = ::copyMessage,
+                            onReport = { reportTarget = it },
+                        )
                     }
                     if (streamingText != null) {
                         item(key = "streaming") {
@@ -265,6 +272,214 @@ fun ChatScreen(
             )
         }
     }
+
+    val submission = reportSubmission
+    reportTarget?.let { target ->
+        ReportDialog(
+            message = target,
+            submitting = submission is ReportSubmissionUiState.Submitting,
+            onSubmit = { category, details ->
+                viewModel.submitReport(target, category, details)
+            },
+            onDismiss = {
+                if (submission !is ReportSubmissionUiState.Submitting) {
+                    reportTarget = null
+                    viewModel.clearReportSubmissionState()
+                }
+            },
+        )
+    }
+
+    when (submission) {
+        is ReportSubmissionUiState.Success -> {
+            AlertDialog(
+                onDismissRequest = {
+                    viewModel.clearReportSubmissionState()
+                    reportTarget = null
+                },
+                containerColor = MaterialTheme.colorScheme.surface,
+                title = { Text("REPORT SUBMITTED", style = MaterialTheme.typography.titleMedium) },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            "Thank you for helping us improve Offline AI.",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Text(
+                            "Your report has been successfully submitted to Shadow Studio Labs.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            "We sincerely apologise for the inconvenience. Our team will review the reported content and use your feedback to improve the app's safety.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            "Reference: ${submission.reference}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        viewModel.clearReportSubmissionState()
+                        reportTarget = null
+                    }) {
+                        Text("OK", style = MaterialTheme.typography.labelMedium)
+                    }
+                },
+            )
+        }
+        is ReportSubmissionUiState.Failure -> {
+            AlertDialog(
+                onDismissRequest = {
+                    viewModel.clearReportSubmissionState()
+                    reportTarget = null
+                },
+                containerColor = MaterialTheme.colorScheme.surface,
+                title = { Text("REPORT NOT SUBMITTED", style = MaterialTheme.typography.titleMedium) },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            submission.message,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            "The report has been saved locally and marked as pending/failed. It has not been marked as submitted. You can retry from Settings → Safety & Reports when ready.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        viewModel.retryReport(submission.reportId)
+                    }) {
+                        Text("RETRY SUBMISSION", style = MaterialTheme.typography.labelMedium)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        viewModel.clearReportSubmissionState()
+                        reportTarget = null
+                    }) {
+                        Text("CLOSE", style = MaterialTheme.typography.labelMedium)
+                    }
+                },
+            )
+        }
+        else -> Unit
+    }
+}
+
+@Composable
+private fun ReportDialog(
+    message: Message,
+    submitting: Boolean,
+    onSubmit: (String, String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val categories = remember {
+        listOf(
+            "Harmful or dangerous content",
+            "Hate or harassment",
+            "Sexual content",
+            "Child safety concern",
+            "Self-harm content",
+            "Illegal or regulated content",
+            "Misinformation or deception",
+            "Privacy or personal data concern",
+            "Offensive or inappropriate response",
+            "Other safety concern",
+        )
+    }
+    var selected by remember { mutableStateOf(categories.first()) }
+    var details by remember { mutableStateOf("") }
+    val preview = remember(message.content) {
+        if (message.content.length > 1200) message.content.take(1200) + "\n…" else message.content
+    }
+
+    AlertDialog(
+        onDismissRequest = { if (!submitting) onDismiss() },
+        containerColor = MaterialTheme.colorScheme.surface,
+        title = { Text("REPORT AI RESPONSE", style = MaterialTheme.typography.titleMedium) },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    "Reason",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                categories.forEach { category ->
+                    TextButton(onClick = { if (!submitting) selected = category }, enabled = !submitting) {
+                        Text(
+                            "${if (selected == category) "[x]" else "[ ]"} $category",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (selected == category) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurface
+                            },
+                        )
+                    }
+                }
+                OutlinedTextField(
+                    value = details,
+                    onValueChange = { if (it.length <= 2000) details = it },
+                    label = { Text("DETAILS (OPTIONAL)", style = MaterialTheme.typography.labelSmall) },
+                    textStyle = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !submitting,
+                    minLines = 2,
+                    maxLines = 4,
+                )
+                Text(
+                    "Content to be sent (preview)",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                Text(
+                    preview.ifBlank { "(empty response)" },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "By tapping SUBMIT REPORT, this report (selected reason, the reported AI response content shown above, your optional details, and limited technical metadata such as model/app version and a report reference context) will be sent to Shadow Studio Labs for safety review. Do not include sensitive personal information in details. Nothing is sent automatically.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (submitting) {
+                    Text(
+                        "Submitting report…",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onSubmit(selected, details) },
+                enabled = !submitting,
+            ) {
+                Text(
+                    if (submitting) "SUBMITTING…" else "SUBMIT REPORT",
+                    style = MaterialTheme.typography.labelMedium,
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !submitting) {
+                Text("CANCEL", style = MaterialTheme.typography.labelMedium)
+            }
+        },
+    )
 }
 
 @Composable
@@ -305,7 +520,11 @@ private fun EmptyState(modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun MessageRow(message: Message, onCopy: (String) -> Unit) {
+private fun MessageRow(
+    message: Message,
+    onCopy: (String) -> Unit,
+    onReport: (Message) -> Unit,
+) {
     val isUser = message.role == "user"
     var showActions by remember { mutableStateOf(false) }
     var copied by remember { mutableStateOf(false) }
@@ -341,6 +560,14 @@ private fun MessageRow(message: Message, onCopy: (String) -> Unit) {
                     showActions = false
                 }) {
                     Text("COPY", style = MaterialTheme.typography.labelSmall)
+                }
+                if (!isUser) {
+                    TextButton(onClick = {
+                        onReport(message)
+                        showActions = false
+                    }) {
+                        Text("REPORT", style = MaterialTheme.typography.labelSmall)
+                    }
                 }
                 if (copied) {
                     Text(
@@ -423,7 +650,6 @@ private fun Composer(
                 Text(
                     "Message…",
                     style = MaterialTheme.typography.bodyMedium,
-                    fontFamily = FontFamily.Monospace,
                 )
             },
             textStyle = MaterialTheme.typography.bodyMedium,

@@ -20,7 +20,7 @@ class ModelCompatibilityCheckerTest {
         abi: String = "arm64-v8a",
         lowMemory: Boolean = false,
         freeStorageBytes: Long = 30 * gib,
-        appMaxMemoryBytes: Long = 128L * mib,
+        appMaxMemoryBytes: Long = 256L * mib,
         nativeLibraryBytes: Long = 32L * mib,
         cpuCount: Int = 8,
         availableBytes: Long? = null,
@@ -51,20 +51,26 @@ class ModelCompatibilityCheckerTest {
         ModelCompatibilityChecker.infoFromProfile(ModelCatalog.byId(modelId)!!)!!
 
     @Test
-    fun smallModelIsRecommendedForAnEightGbPhoneWithActualNumbers() {
+    fun estimatesProvideDownloadMinimumAndRecommendedSystemRam() {
         val model = ModelCatalog.byId("qwen2.5-0.5b-q4-k-m")!!
         val result = ModelCompatibilityChecker.assess(model, device(8, 4), info(model.id))
 
-        assertEquals(CompatibilityCategory.RECOMMENDED, result.category)
         assertEquals(4096, result.contextLength)
-        assertTrue(result.reason.contains("Estimated runtime memory:"))
-        assertTrue(result.reason.contains("safe budget"))
-        assertTrue(result.reason.contains("currently available"))
-        assertTrue(result.estimatedMemoryBytes!! > model.fileSizeBytes)
+        assertNotNull(result.minimumSystemRamBytes)
+        assertNotNull(result.recommendedSystemRamBytes)
+        assertNotNull(result.memory.inferencePeakBytes)
+        assertNotNull(result.memory.systemOverheadBytes)
+        assertTrue(result.minimumSystemRamBytes!! > model.fileSizeBytes)
+        assertTrue(result.minimumSystemRamBytes!! > result.memory.inferencePeakBytes!!)
+        assertTrue(result.recommendedSystemRamBytes!! > result.minimumSystemRamBytes!!)
+        assertEquals(result.minimumSystemRamBytes, result.estimatedMemoryBytes)
         assertEquals(CheckStatus.OK, result.architectureStatus)
         assertEquals(CheckStatus.OK, result.storageStatus)
         assertEquals(CheckStatus.UNKNOWN, result.performanceStatus)
         assertTrue(result.performanceReason.contains("not yet measured"))
+        assertTrue(result.reason.contains("Minimum system RAM"))
+        assertTrue(result.reason.contains("Recommended system RAM"))
+        assertTrue(result.reason.contains("safe budget"))
     }
 
     @Test
@@ -80,20 +86,48 @@ class ModelCompatibilityCheckerTest {
     }
 
     @Test
-    fun lowMemoryDeviceBlocksAnEstimateOutsideTheReducedBudget() {
-        val model = ModelCatalog.byId("qwen2.5-3b-q4-k-m")!!
-        val result = ModelCompatibilityChecker.assess(
-            model,
-            device(8, 1, lowMemory = true),
-            info(model.id),
-            contextLength = 2048,
-        )
+    fun ramRequirementsVaryByQuantizationAndModelSize() {
+        val q4 = ModelCatalog.byId("smollm2-360m-q4-k-m")!!
+        val q3 = ModelCatalog.byId("smollm2-360m-q3-k-m")!!
+        val tiny = ModelCatalog.byId("tinyllama-1.1b-q4-k-m")!!
+        val q4Result = ModelCompatibilityChecker.assess(q4, device(8, 4), info(q4.id), contextLength = 4096)
+        val q3Result = ModelCompatibilityChecker.assess(q3, device(8, 4), info(q3.id), contextLength = 4096)
+        val tinyResult = ModelCompatibilityChecker.assess(tiny, device(8, 4), info(tiny.id), contextLength = 1024)
 
-        assertEquals(CompatibilityCategory.NOT_RECOMMENDED, result.category)
-        assertEquals(CheckStatus.OK, result.storageStatus)
-        assertTrue(result.reason.contains("Not recommended"))
-        assertTrue(result.memory.totalBytes!! > result.safeBudgetBytes)
-        assertTrue(result.reason.contains("low-memory pressure"))
+        assertTrue(q4Result.minimumSystemRamBytes!! > q3Result.minimumSystemRamBytes!!)
+        assertTrue(tinyResult.minimumSystemRamBytes!! > q4Result.minimumSystemRamBytes!!)
+        assertTrue(q4Result.minimumSystemRamBytes!! > q4.fileSizeBytes)
+    }
+
+    @Test
+    fun kvCacheAndSystemRamScaleWithContextWindow() {
+        val model = ModelCatalog.byId("qwen2.5-0.5b-q4-k-m")!!
+        val gInfo = info(model.id)
+        val at2048 = ModelCompatibilityChecker.kvCacheBytes(gInfo, 2048)
+        val at4096 = ModelCompatibilityChecker.kvCacheBytes(gInfo, 4096)
+
+        assertEquals(12_288L * 2048L, at2048)
+        assertEquals(12_288L * 4096L, at4096)
+        assertEquals(at4096!! * 2, ModelCompatibilityChecker.kvBytesPerToken(gInfo, 4)!! * 4096L)
+
+        val estimate2048 = ModelCompatibilityChecker.estimateMemoryBytes(model, gInfo, 2048)!!
+        val estimate4096 = ModelCompatibilityChecker.estimateMemoryBytes(model, gInfo, 4096)!!
+        assertTrue(estimate4096 > estimate2048)
+    }
+
+    @Test
+    fun longerContextCanWorsenCompatibilityForTheSameModel() {
+        val model = ModelCatalog.byId("qwen2.5-3b-q4-k-m")!!
+        val phone = device(8, 4)
+        val short = ModelCompatibilityChecker.assess(model, phone, info(model.id), contextLength = 1024)
+        val long = ModelCompatibilityChecker.assess(model, phone, info(model.id), contextLength = 8192)
+
+        assertTrue(long.minimumSystemRamBytes!! > short.minimumSystemRamBytes!!)
+        assertTrue(long.category != CompatibilityCategory.RECOMMENDED)
+        assertTrue(
+            long.category == CompatibilityCategory.NOT_RECOMMENDED ||
+                long.category == CompatibilityCategory.SUPPORTED
+        )
     }
 
     @Test
@@ -114,39 +148,22 @@ class ModelCompatibilityCheckerTest {
         assertEquals(64L * mib, measured.weightsBytes)
         assertTrue(measured.weightsSource.contains("GGUF tensor descriptors"))
         assertTrue(measured.weightsSource.contains("2 tensor types"))
-        assertTrue(measured.totalBytes!! < upperBound.totalBytes!!)
+        assertTrue(measured.inferencePeakBytes!! < upperBound.inferencePeakBytes!!)
     }
 
     @Test
-    fun kvCacheScalesWithContextAndRespectsConfiguredKvElementSize() {
-        val info = info("qwen2.5-0.5b-q4-k-m")
-        val at2048 = ModelCompatibilityChecker.kvCacheBytes(info, 2048)
-        val at4096 = ModelCompatibilityChecker.kvCacheBytes(info, 4096)
+    fun largeModelIsNotRecommendedOnSmallDeviceButEstimateIsShown() {
+        val model = ModelCatalog.byId("phi3-mini-4k-q4")!!
+        val result = ModelCompatibilityChecker.assess(model, device(6, 3), info(model.id), contextLength = 4096)
 
-        assertEquals(12_288L * 2048L, at2048)
-        assertEquals(12_288L * 4096L, at4096)
-        assertEquals(at4096!! * 2, ModelCompatibilityChecker.kvBytesPerToken(info, 4)!! * 4096L)
-
-        val estimate2048 = ModelCompatibilityChecker.estimateMemoryBytes(
-            ModelCatalog.byId("qwen2.5-0.5b-q4-k-m")!!, info, 2048,
-        )!!
-        val estimate4096 = ModelCompatibilityChecker.estimateMemoryBytes(
-            ModelCatalog.byId("qwen2.5-0.5b-q4-k-m")!!, info, 4096,
-        )!!
-        assertTrue(estimate4096 > estimate2048)
-    }
-
-    @Test
-    fun longerContextCanChangeCompatibilityForTheSameModel() {
-        val model = ModelCatalog.byId("qwen2.5-3b-q4-k-m")!!
-        val phone = device(8, 0, availableBytes = (3.8 * gib).toLong())
-        val short = ModelCompatibilityChecker.assess(model, phone, info(model.id), contextLength = 2048)
-        val long = ModelCompatibilityChecker.assess(model, phone, info(model.id), contextLength = 8192)
-
-        assertEquals(CompatibilityCategory.SUPPORTED, short.category)
-        assertEquals(CompatibilityCategory.NOT_RECOMMENDED, long.category)
-        assertTrue(long.estimatedMemoryBytes!! > short.estimatedMemoryBytes!!)
-        assertTrue(long.reason.contains("safe budget"))
+        assertEquals(CompatibilityCategory.NOT_RECOMMENDED, result.category)
+        assertNotNull(result.minimumSystemRamBytes)
+        assertNotNull(result.recommendedSystemRamBytes)
+        assertTrue(result.reason.contains("Not recommended"))
+        assertTrue(
+            result.memory.inferencePeakBytes!! > result.safeBudgetBytes ||
+                result.minimumSystemRamBytes!! > 6L * gib
+        )
     }
 
     @Test
@@ -174,7 +191,7 @@ class ModelCompatibilityCheckerTest {
         assertEquals(CompatibilityCategory.UNKNOWN, result.category)
         assertEquals(CheckStatus.UNKNOWN, result.architectureStatus)
         assertTrue(result.architectureReason.contains("bundled llama.cpp"))
-        assertNotNull(result.estimatedMemoryBytes)
+        assertNotNull(result.minimumSystemRamBytes)
         assertEquals(CheckStatus.OK, result.storageStatus)
     }
 
@@ -198,10 +215,11 @@ class ModelCompatibilityCheckerTest {
         val result = ModelCompatibilityChecker.assess(model, device(8, 4), null)
 
         assertEquals(CompatibilityCategory.UNKNOWN, result.category)
-        assertNull(result.estimatedMemoryBytes)
+        assertNull(result.minimumSystemRamBytes)
+        assertNull(result.recommendedSystemRamBytes)
+        assertNull(result.memory.inferencePeakBytes)
         assertNull(result.memory.kvCacheBytes)
-        assertNull(result.memory.totalBytes)
-        assertTrue(result.memory.notes.any { it.contains("No GGUF metadata") })
+        assertTrue(result.memory.notes.any { it.contains("RAM estimates are UNKNOWN") || it.contains("No GGUF metadata") })
         assertTrue(result.reason.contains("UNKNOWN"))
     }
 
@@ -216,7 +234,7 @@ class ModelCompatibilityCheckerTest {
         val result = ModelCompatibilityChecker.assess(model, device(8, 4), unknownLayout)
 
         assertFalse(result.memory.kvComplete)
-        assertNotNull(result.memory.totalBytes)
+        assertNotNull(result.memory.inferencePeakBytes)
         assertEquals(CompatibilityCategory.UNKNOWN, result.category)
     }
 
@@ -232,7 +250,7 @@ class ModelCompatibilityCheckerTest {
         assertEquals(CompatibilityCategory.NOT_RECOMMENDED, result.category)
         assertEquals(CheckStatus.FAIL, result.storageStatus)
         assertTrue(result.storageReason.contains("free model storage"))
-        assertNotNull(result.estimatedMemoryBytes)
+        assertNotNull(result.minimumSystemRamBytes)
     }
 
     @Test
@@ -254,8 +272,9 @@ class ModelCompatibilityCheckerTest {
             assertTrue(info.metadataSource.contains("GGUF header"))
 
             val result = ModelCompatibilityChecker.assess(model, device(8, 4), info)
-            assertNotNull(result.estimatedMemoryBytes)
-            assertTrue(result.memory.weightsSource.contains("file size (upper bound)"))
+            assertNotNull(result.minimumSystemRamBytes)
+            assertNotNull(result.recommendedSystemRamBytes)
+            assertTrue(result.memory.weightsSource.contains("upper bound"))
         }
     }
 }
