@@ -1,11 +1,24 @@
 package com.soprso.dhurandharai.ui.screens
 
+import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ApplicationInfo
+import android.net.Uri
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -13,14 +26,17 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
@@ -43,6 +59,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
@@ -50,7 +67,11 @@ import com.soprso.dhurandharai.chat.ChatViewModel
 import com.soprso.dhurandharai.chat.MessageCopyPayload
 import com.soprso.dhurandharai.chat.ReportSubmissionUiState
 import com.soprso.dhurandharai.database.Message
+import com.soprso.dhurandharai.document.AttachmentMime
+import com.soprso.dhurandharai.document.DocumentAttachment
+import com.soprso.dhurandharai.ui.screens.AttachmentComposer
 import kotlinx.coroutines.delay
+import java.io.File
 
 private val ExamplePrompts = listOf(
     "Explain how a transformer model works",
@@ -75,6 +96,9 @@ fun ChatScreen(
     var input by remember { mutableStateOf("") }
     var elapsedSeconds by remember { mutableStateOf(0) }
     var reportTarget by remember { mutableStateOf<Message?>(null) }
+    var selectedUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    var selectedUrisMutable by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    var showAttachmentChooser by remember { mutableStateOf(false) }
 
     val messages by viewModel.messages.collectAsState()
     val modelName by viewModel.currentModelName.collectAsState()
@@ -83,10 +107,95 @@ fun ChatScreen(
     val error by viewModel.error.collectAsState()
     val performanceSummary by viewModel.performanceSummary.collectAsState()
     val reportSubmission by viewModel.reportSubmission.collectAsState()
+    val messageAttachments by viewModel.attachmentViewModel.attachments.collectAsState()
 
     val listState = rememberLazyListState()
     val context = LocalContext.current
     val isDebugBuild = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+
+    // Supported attachment MIME types (images + documents).
+    val ALL_ATTACHMENT_MIME_TYPES = arrayOf(
+        "image/jpeg", "image/jpg", "image/png", "image/webp",
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "text/plain", "text/markdown", "text/csv",
+    )
+
+    /** Adds URIs to the selected attachments list, persisting read permission where possible. */
+    fun addSelectedUris(newUris: List<Uri>) {
+        for (uri in newUris) {
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            } catch (e: Exception) {
+                // Non-fatal: permission may not be persistable on all providers.
+            }
+            selectedUrisMutable = selectedUrisMutable + uri
+        }
+        selectedUris = selectedUrisMutable
+    }
+
+    // Document picker launcher (SAF): all supported types, multiple selection,
+    // directory navigation (Gallery, Downloads, Documents, internal storage, etc.).
+    val pickDocumentsLauncher = rememberLauncherForActivityResult(
+        StartActivityForResult(),
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val data = result.data ?: return@rememberLauncherForActivityResult
+            val uris = mutableListOf<Uri>()
+            data.clipData?.let { clip ->
+                for (i in 0 until clip.itemCount) {
+                    clip.getItemAt(i).uri?.let { uris.add(it) }
+                }
+            }
+            data.data?.let { uris.add(it) }
+            if (uris.isNotEmpty()) {
+                addSelectedUris(uris)
+            }
+        }
+    }
+
+    // Photo Picker launcher (API 33+, gracefully falls back on older devices):
+    // image-only selection for Gallery / Photos access.
+    val pickVisualMediaLauncher = rememberLauncherForActivityResult(
+        PickVisualMedia(),
+    ) { uri: Uri? ->
+        if (uri != null) {
+            addSelectedUris(listOf(uri))
+        }
+    }
+
+    /** Safely launches the document picker with a resolvable type, guarding against
+     *  ActivityNotFoundException on devices without a compatible DocumentsUI. */
+    fun launchBrowseFiles() {
+        showAttachmentChooser = false
+        try {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+                putExtra(Intent.EXTRA_MIME_TYPES, ALL_ATTACHMENT_MIME_TYPES)
+                putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+            }
+            pickDocumentsLauncher.launch(intent)
+        } catch (e: Exception) {
+            // Swallow rather than crash; user can still type and send text messages.
+        }
+    }
+
+    /** Opens the Android Photo Picker for Gallery / Photos selection. */
+    fun launchPhotos() {
+        showAttachmentChooser = false
+        try {
+            pickVisualMediaLauncher.launch(
+                PickVisualMediaRequest(PickVisualMedia.ImageOnly)
+            )
+        } catch (e: Exception) {
+            // Swallow rather than crash.
+        }
+    }
 
     // Keep the newest message (or the live token stream) in view.
     LaunchedEffect(messages.size, streamingText) {
@@ -204,6 +313,7 @@ fun ChatScreen(
                     items(messages, key = { it.id }) { msg ->
                         MessageRow(
                             message = msg,
+                            attachments = messageAttachments[msg.conversationId]?.filter { it.messageId == msg.id } ?: emptyList(),
                             onCopy = ::copyMessage,
                             onReport = { reportTarget = it },
                         )
@@ -211,10 +321,11 @@ fun ChatScreen(
                     if (streamingText != null) {
                         item(key = "streaming") {
                             StreamingRow(streamingText.orEmpty(), isGenerating)
-                        }
-                    }
-                }
             }
+        }
+    }
+}
+
 
             if (error != null) {
                 Row(
@@ -260,9 +371,21 @@ fun ChatScreen(
                 input = input,
                 onInputChange = { input = it },
                 generating = isGenerating,
+                selectedUris = selectedUris,
+                onAttachmentAdded = { showAttachmentChooser = true },
+                onAttachmentRemoved = { index ->
+                    selectedUrisMutable = selectedUrisMutable.filterIndexed { i, _ -> i != index }
+                    selectedUris = selectedUrisMutable
+                },
                 onSend = {
-                    if (input.isNotBlank() && viewModel.sendMessage(input)) {
-                        input = ""
+                    val hasText = input.isNotBlank()
+                    val hasAttachments = selectedUris.isNotEmpty()
+                    if (hasText || hasAttachments) {
+                        if (viewModel.sendMessage(input, selectedUris)) {
+                            input = ""
+                            selectedUrisMutable = emptyList()
+                            selectedUris = emptyList()
+                        }
                     }
                 },
                 onStop = viewModel::stopGeneration,
@@ -270,6 +393,52 @@ fun ChatScreen(
                     .fillMaxWidth()
                     .padding(horizontal = 12.dp, vertical = 8.dp),
             )
+
+            // Attachment chooser dialog (Browse Files).
+            if (showAttachmentChooser) {
+                AlertDialog(
+                    onDismissRequest = { showAttachmentChooser = false },
+                    confirmButton = { },
+                    title = {
+                        Text(
+                            text = "ATTACHMENTS",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                    },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            TextButton(
+                                onClick = { launchPhotos() },
+                            ) {
+                                Text(
+                                    text = "PHOTOS & VIDEOS",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                            TextButton(
+                                onClick = { launchBrowseFiles() },
+                            ) {
+                                Text(
+                                    text = "BROWSE FILES",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                            TextButton(
+                                onClick = { showAttachmentChooser = false },
+                            ) {
+                                Text(
+                                    text = "CANCEL",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    },
+                )
+            }
         }
     }
 
@@ -522,6 +691,7 @@ private fun EmptyState(modifier: Modifier = Modifier) {
 @Composable
 private fun MessageRow(
     message: Message,
+    attachments: List<DocumentAttachment> = emptyList(),
     onCopy: (String) -> Unit,
     onReport: (Message) -> Unit,
 ) {
@@ -548,6 +718,12 @@ private fun MessageRow(
             ),
         ) {
             Bubble(message.content, isUser = isUser)
+            if (attachments.isNotEmpty()) {
+                AttachmentStrip(
+                    attachments = attachments,
+                    isUser = isUser,
+                )
+            }
         }
         if (showActions) {
             Row(
@@ -633,43 +809,178 @@ private fun Composer(
     input: String,
     onInputChange: (String) -> Unit,
     generating: Boolean,
+    selectedUris: List<Uri>,
+    onAttachmentAdded: () -> Unit,
+    onAttachmentRemoved: (Int) -> Unit,
     onSend: () -> Unit,
     onStop: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Row(
-        modifier = modifier,
-        verticalAlignment = Alignment.Bottom,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        OutlinedTextField(
-            value = input,
-            onValueChange = onInputChange,
-            modifier = Modifier.weight(1f),
-            placeholder = {
-                Text(
-                    "Message…",
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            },
-            textStyle = MaterialTheme.typography.bodyMedium,
-            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-            keyboardActions = KeyboardActions(onSend = { onSend() }),
-            minLines = 1,
-            maxLines = 6,
-        )
-        IconButton(
-            onClick = { if (generating) onStop() else onSend() },
-            enabled = generating || input.isNotBlank(),
-            colors = IconButtonDefaults.iconButtonColors(
-                contentColor = MaterialTheme.colorScheme.primary,
-            ),
-        ) {
-            Text(
-                text = if (generating) "■" else "▶",
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.primary,
+    Column(modifier = modifier) {
+        // Compact attachment previews inside the composer container.
+        if (selectedUris.isNotEmpty()) {
+            AttachmentComposer(
+                uris = selectedUris,
+                onRemove = onAttachmentRemoved,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp, vertical = 4.dp),
             )
         }
+
+        // One rounded rectangular input container: + button, message input, send button.
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(
+                    color = MaterialTheme.colorScheme.surface,
+                    shape = RoundedCornerShape(12.dp),
+                )
+                .border(
+                    width = 2.dp,
+                    color = MaterialTheme.colorScheme.primary,
+                    shape = RoundedCornerShape(12.dp),
+                )
+                .padding(horizontal = 8.dp, vertical = 6.dp),
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                // Plus (+) attachment button inside the container.
+                IconButton(
+                    onClick = onAttachmentAdded,
+                    colors = IconButtonDefaults.iconButtonColors(
+                        contentColor = MaterialTheme.colorScheme.primary,
+                    ),
+                ) {
+                    Text(
+                        text = "+",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+
+                // Message text input (BasicTextField so the outer Box provides the
+                // single rounded border — no inner border between + and the text).
+                BasicTextField(
+                    value = input,
+                    onValueChange = onInputChange,
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp, max = 192.dp),
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(
+                        color = MaterialTheme.colorScheme.onSurface,
+                    ),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                    keyboardActions = KeyboardActions(onSend = { onSend() }),
+                    singleLine = false,
+                    maxLines = 6,
+                    decorationBox = { content ->
+                        Box(
+                            modifier = Modifier.fillMaxWidth(),
+                            contentAlignment = Alignment.CenterStart,
+                        ) {
+                            content()
+                            if (input.isEmpty()) {
+                                Text(
+                                    text = "Message…",
+                                    style = MaterialTheme.typography.bodyMedium.copy(
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    ),
+                                    modifier = Modifier
+                                        .align(Alignment.CenterStart)
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                )
+                            }
+                        }
+                    },
+                )
+
+                // Send/stop button.
+                IconButton(
+                    onClick = { if (generating) onStop() else onSend() },
+                    enabled = generating || input.isNotBlank() || selectedUris.isNotEmpty(),
+                    colors = IconButtonDefaults.iconButtonColors(
+                        contentColor = MaterialTheme.colorScheme.primary,
+                    ),
+                ) {
+                    Text(
+                        text = if (generating) "■" else "▶",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Shows compact attachment chips inside a sent/received message bubble.
+ * Images show a small thumbnail; documents show a type + filename chip.
+ */
+@Composable
+private fun AttachmentStrip(
+    attachments: List<DocumentAttachment>,
+    isUser: Boolean,
+) {
+    val color = if (isUser) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.surface
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 4.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        attachments.forEach { att ->
+            MessageAttachmentChip(att, color)
+        }
+    }
+}
+
+@Composable
+private fun MessageAttachmentChip(
+    att: DocumentAttachment,
+    backgroundColor: Color,
+) {
+    val context = LocalContext.current
+    val isImage = att.mimeType.lowercase().startsWith("image/")
+    val displayName = att.fileName.take(24)
+    val typeLabel = att.mimeType.lowercase().takeIf { it.isNotEmpty() }?.substringAfterLast("/")?.uppercase()?.firstOrNull()?.toString() ?: "DOC"
+    val chipText = if (isImage) "IMG" else typeLabel
+
+    Row(
+        modifier = Modifier
+            .background(backgroundColor, RoundedCornerShape(6.dp))
+            .padding(horizontal = 6.dp, vertical = 4.dp)
+            .size(width = 120.dp, height = 34.dp)
+            .clickable {
+                att.localPath?.let { path ->
+                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(Uri.fromFile(File(path)), att.mimeType)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    context.startActivity(intent)
+                }
+            },
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text(
+            text = chipText,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = displayName,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurface,
+            maxLines = 1,
+            modifier = Modifier.weight(1f).padding(horizontal = 2.dp),
+        )
     }
 }

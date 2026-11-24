@@ -1,12 +1,17 @@
 package com.soprso.dhurandharai.chat
 
 import android.app.Application
+import android.net.Uri
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.soprso.dhurandharai.database.AppDatabase
 import com.soprso.dhurandharai.database.Conversation
 import com.soprso.dhurandharai.database.Message
+import com.soprso.dhurandharai.document.AttachmentViewModel
+import com.soprso.dhurandharai.document.DocumentAttachment
+import com.soprso.dhurandharai.document.DocumentStorage
+import com.soprso.dhurandharai.imagegen.ImageGenerationResult
 import com.soprso.dhurandharai.inference.EngineState
 import com.soprso.dhurandharai.inference.ModelEngine
 import com.soprso.dhurandharai.safety.ContentSafety
@@ -49,6 +54,7 @@ sealed interface ReportSubmissionUiState {
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val db = AppDatabase.get(application)
+    val attachmentViewModel: AttachmentViewModel = AttachmentViewModel(application)
 
     /** Currently open conversation, null until the first message is sent. */
     private val _activeConversationId = MutableStateFlow<String?>(null)
@@ -99,6 +105,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _reportSubmission = MutableStateFlow<ReportSubmissionUiState>(ReportSubmissionUiState.Idle)
     val reportSubmission: StateFlow<ReportSubmissionUiState> = _reportSubmission.asStateFlow()
 
+    /** Transient confirmation for image save/delete operations. */
+    private val _imageNotice = MutableStateFlow<String?>(null)
+    val imageNotice: StateFlow<String?> = _imageNotice.asStateFlow()
+
+    init {
+        // Attachments (including persisted images) must be observed whenever a
+        // saved conversation is opened, not only for the newly created one.
+        viewModelScope.launch {
+            _activeConversationId.collect { id ->
+                if (id != null) attachmentViewModel.observeAttachments(id)
+            }
+        }
+    }
+
+    fun clearImageNotice() {
+        _imageNotice.value = null
+    }
+
     fun clearError() {
         _error.value = null
     }
@@ -124,18 +148,21 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Persists the user's message, then runs generation if a model is loaded.
+     * Persists the user's message with optional attachments, then runs generation
+     * if a model is loaded. Document context from attachments is prepended to the
+     * prompt for generation but the original text is persisted as-is.
      * Returns true only when this call accepted the submission.
+     *
+     * [uris] are the content URIs selected by the user in this composition. They are
+     * copied to local storage, processed (text extraction / OCR), and linked to the
+     * persisted message before generation runs.
      */
-    fun sendMessage(text: String): Boolean {
+    fun sendMessage(text: String, uris: List<Uri> = emptyList()): Boolean {
         val trimmed = text.trim()
-        if (trimmed.isEmpty()) return false
+        if (trimmed.isEmpty() && uris.isEmpty()) return false
         _error.value = null
         _performanceSummary.value = null
 
-        // Local, on-device input safeguard: a blocked prompt is never persisted
-        // or handed to the inference engine, and never acquires the submission
-        // guard (which is released only by the generation coroutine).
         val promptVerdict = ContentSafety.screenPrompt(trimmed)
         if (promptVerdict.blocked) {
             _error.value = "SAFETY · ${promptVerdict.category?.label ?: "BLOCKED"} — " +
@@ -147,7 +174,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _isGenerating.value = true
         viewModelScope.launch {
             try {
-                sendInternal(trimmed)
+                sendInternal(trimmed, uris)
             } catch (t: Throwable) {
                 _error.value = friendlyError(t.message ?: "Message could not be sent")
             } finally {
@@ -159,7 +186,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         return true
     }
 
-    private suspend fun sendInternal(text: String) {
+    private suspend fun sendInternal(text: String, uris: List<Uri>) {
         val now = System.currentTimeMillis()
         val existingId = _activeConversationId.value
         val conversationId = existingId ?: UUID.randomUUID().toString()
@@ -176,9 +203,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         _activeConversationId.value = conversationId
 
+        // Process attachments: copy to local storage, extract text / OCR, persist metadata.
+        val attachmentIds = if (uris.isNotEmpty()) {
+            attachmentViewModel.addAttachments(conversationId, null, uris)
+        } else emptyList()
+
+        // Persist the user message (original text only, no document context).
+        val messageId = UUID.randomUUID().toString()
         db.messageDao().insert(
             Message(
-                id = UUID.randomUUID().toString(),
+                id = messageId,
                 conversationId = conversationId,
                 role = "user",
                 content = text,
@@ -187,21 +221,43 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         )
         db.conversationDao().touchUpdatedAt(conversationId, now)
 
-        generateReply(conversationId)
+        // Link attachments to this message so they appear in conversation history.
+        if (attachmentIds.isNotEmpty()) {
+            attachmentViewModel.linkAttachmentsToMessage(attachmentIds, messageId)
+        }
+
+        // Build document context from just the attachments attached to THIS message.
+        val docContext = if (attachmentIds.isNotEmpty()) {
+            val msgAtts = attachmentViewModel.getAttachmentsForMessage(messageId)
+            attachmentViewModel.buildContextFromAttachments(msgAtts)
+        } else null
+
+        // Build generation messages: history + document context + user text.
+        generateReply(conversationId, text, docContext)
     }
 
-    private suspend fun generateReply(conversationId: String) {
+    private suspend fun generateReply(
+        conversationId: String,
+        userText: String,
+        documentContext: String?,
+    ) {
         if (!ModelEngine.isLoaded) {
             _error.value = "No model loaded. Open Models and select one first."
             return
         }
 
         val history = db.messageDao().getForConversation(conversationId)
-        val flat = ArrayList<String>(history.size * 2)
+        val flat = ArrayList<String>(history.size * 2 + 2)
         history.forEach {
             flat.add(it.role)
             flat.add(it.content)
         }
+
+        // Prepend document context to the current user turn if available.
+        val userContent = if (documentContext.isNullOrBlank()) userText else "$documentContext\n\n--- USER MESSAGE ---\n$userText"
+
+        flat.add("user")
+        flat.add(userContent)
         if (flat.isEmpty()) return
 
         val modelName = currentModelName.value ?: "model"
@@ -218,13 +274,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 onToken = onToken@{ piece ->
                     if (blockedCategory != null) return@onToken
                     collected.append(piece)
-                    // Output safeguard: screen the accumulated reply as it
-                    // streams so unsafe text is stopped early and never saved.
                     val verdict = ContentSafety.screenResponse(collected.toString())
                     if (verdict.blocked) {
                         blockedCategory = verdict.category
                         _streamingText.value = null
-                        ModelEngine.cancel() // lock-free native cancel
+                        ModelEngine.cancel()
                         return@onToken
                     }
                     val now = SystemClock.elapsedRealtime()
@@ -244,7 +298,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             _performanceSummary.value = "perf · ${metrics.compactSummary()}$code"
         }
 
-        // Final check covers replies that produced no streamed tokens.
         val outputVerdict = blockedCategory?.let { SafetyVerdict(true, it) }
             ?: ContentSafety.screenResponse(result ?: collected.toString())
 
@@ -315,7 +368,110 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun deleteConversation(id: String) {
         viewModelScope.launch {
             if (_activeConversationId.value == id) _activeConversationId.value = null
-            db.conversationDao().delete(id) // messages cascade
+            val attachments = db.documentAttachmentDao().getForConversation(id)
+            db.conversationDao().delete(id) // messages and attachment rows cascade
+            // Remove files only after the rows are gone, and only if no other
+            // attachment (in this or another conversation) still references them.
+            attachments.forEach { attachment ->
+                val local = attachment.localPath
+                if (local != null &&
+                    db.documentAttachmentDao().countOtherLocalReferences(local, attachment.id) == 0
+                ) {
+                    DocumentStorage.deletePath(getApplication(), local)
+                }
+                val thumbnail = attachment.thumbnailPath
+                if (thumbnail != null &&
+                    db.documentAttachmentDao().countOtherThumbnailReferences(thumbnail, attachment.id) == 0
+                ) {
+                    DocumentStorage.deletePath(getApplication(), thumbnail)
+                }
+            }
+        }
+    }
+
+    /**
+     * Saves an image's original bytes to a destination chosen by the user via
+     * the Storage Access Framework. Never writes to a cache directory.
+     */
+    fun saveImageAttachment(attachment: DocumentAttachment, destination: Uri) {
+        viewModelScope.launch {
+            val saved = attachmentViewModel.saveImageToUri(attachment, destination)
+            _imageNotice.value = if (saved) {
+                "Image saved to the selected location."
+            } else {
+                "The original image is missing or could not be saved."
+            }
+        }
+    }
+
+    /**
+     * Deletes an image attachment. If its message only held that image, the
+     * now-empty message is removed too. Files stay on disk when shared.
+     */
+    fun deleteImageAttachment(attachment: DocumentAttachment, message: Message) {
+        viewModelScope.launch {
+            attachmentViewModel.deleteAttachment(attachment.id)
+            val remaining = db.documentAttachmentDao().getForMessage(message.id)
+            if (message.content.isBlank() && remaining.isEmpty()) {
+                db.messageDao().deleteById(message.id)
+            }
+            db.conversationDao().touchUpdatedAt(message.conversationId, System.currentTimeMillis())
+            _imageNotice.value = "Image deleted from this device."
+        }
+    }
+
+    /**
+     * Integration point for a future local diffusion engine. The engine writes
+     * an image file in its own cache/output directory and returns an
+     * [ImageGenerationResult]; this method persists it and attaches it to an
+     * assistant message using the same validated pipeline as picked images.
+     */
+    fun attachGeneratedImage(result: ImageGenerationResult) {
+        viewModelScope.launch {
+            val now = System.currentTimeMillis()
+            val existingId = _activeConversationId.value
+            val conversationId = existingId ?: UUID.randomUUID().toString()
+            if (existingId == null) {
+                db.conversationDao().upsert(
+                    Conversation(
+                        id = conversationId,
+                        title = result.prompt.take(48).ifBlank { "Generated image" },
+                        createdAt = now,
+                        updatedAt = now,
+                    ),
+                )
+            }
+            _activeConversationId.value = conversationId
+
+            val messageId = UUID.randomUUID().toString()
+            db.messageDao().insert(
+                Message(
+                    id = messageId,
+                    conversationId = conversationId,
+                    role = "assistant",
+                    content = "",
+                    createdAt = now,
+                ),
+            )
+
+            val attachment = attachmentViewModel.importGeneratedImage(
+                conversationId = conversationId,
+                messageId = messageId,
+                sourceFile = result.imageFile,
+                fileName = result.imageFile.name.ifBlank { "generated_image" },
+                mimeType = result.mimeType,
+                prompt = result.prompt,
+                modelName = result.modelName,
+            )
+
+            if (attachment == null) {
+                db.messageDao().deleteById(messageId)
+                if (existingId == null) db.conversationDao().delete(conversationId)
+                _error.value = "The generated image could not be stored. The file may be missing or corrupt."
+                return@launch
+            }
+            db.conversationDao().touchUpdatedAt(conversationId, now)
+            _imageNotice.value = "Image generated and saved locally."
         }
     }
 

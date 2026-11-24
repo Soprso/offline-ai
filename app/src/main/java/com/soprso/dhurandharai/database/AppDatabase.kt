@@ -8,8 +8,8 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
-    entities = [Conversation::class, Message::class, ModelMetadata::class, DownloadRecord::class],
-    version = 3,
+    entities = [Conversation::class, Message::class, ModelMetadata::class, DownloadRecord::class, DocumentAttachmentEntity::class],
+    version = 5,
     exportSchema = true,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -17,6 +17,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun messageDao(): MessageDao
     abstract fun modelDao(): ModelDao
     abstract fun downloadDao(): DownloadDao
+    abstract fun documentAttachmentDao(): DocumentAttachmentDao
 
     companion object {
         val MIGRATION_1_2 = object : Migration(1, 2) {
@@ -64,6 +65,66 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `document_attachments` (
+                        `id` TEXT NOT NULL,
+                        `conversationId` TEXT NOT NULL,
+                        `messageId` TEXT,
+                        `fileName` TEXT NOT NULL,
+                        `mimeType` TEXT NOT NULL,
+                        `sizeBytes` INTEGER NOT NULL,
+                        `contentUri` TEXT,
+                        `localPath` TEXT,
+                        `thumbnailPath` TEXT,
+                        `status` TEXT NOT NULL,
+                        `errorCode` TEXT,
+                        `errorMessage` TEXT,
+                        `progress` REAL NOT NULL,
+                        `extractedText` TEXT,
+                        `ocrText` TEXT,
+                        `pageCount` INTEGER NOT NULL,
+                        `imageCount` INTEGER NOT NULL,
+                        `processedAt` INTEGER NOT NULL,
+                        `createdAt` INTEGER NOT NULL,
+                        PRIMARY KEY (`id`),
+                        FOREIGN KEY (`conversationId`) REFERENCES `conversations` (`id`) ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `idx_document_attachments_conversation_id` ON `document_attachments` (`conversationId`)",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `idx_document_attachments_message_id` ON `document_attachments` (`messageId`)",
+                )
+            }
+        }
+
+        /**
+         * Image support on top of the attachment model: dimensions plus the
+         * local generation prompt/model. Image binaries remain on disk; only
+         * these small metadata columns are added.
+         */
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE `document_attachments` ADD COLUMN `width` INTEGER NOT NULL DEFAULT 0",
+                )
+                db.execSQL(
+                    "ALTER TABLE `document_attachments` ADD COLUMN `height` INTEGER NOT NULL DEFAULT 0",
+                )
+                db.execSQL(
+                    "ALTER TABLE `document_attachments` ADD COLUMN `prompt` TEXT",
+                )
+                db.execSQL(
+                    "ALTER TABLE `document_attachments` ADD COLUMN `modelName` TEXT",
+                )
+            }
+        }
+
         @Volatile
         private var instance: AppDatabase? = null
 
@@ -77,6 +138,6 @@ abstract class AppDatabase : RoomDatabase() {
                 context.applicationContext,
                 AppDatabase::class.java,
                 "offline_ai.db",
-            ).addMigrations(MIGRATION_1_2, MIGRATION_2_3).build()
+            ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5).build()
     }
 }

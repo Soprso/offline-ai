@@ -13,6 +13,12 @@ composeBom = "2025.10.01"        # ui 1.9.4 / material3 1.4.0 / minCompileSdk 35
 
 # --- AndroidX (only what the app actually uses) ---
 coreKtx = "1.16.0"
+documentFile = "1.0.1"
+
+# --- ML Kit (on-device OCR, Google Play Services variant to keep APK small) ---
+mlKitTextRecognition = "18.0.2"
+
+# --- SAF / document processing ---
 activityCompose = "1.10.1"
 lifecycle = "2.9.4"
 navigationCompose = "2.9.8"
@@ -27,6 +33,12 @@ androidx-navigation-compose = { group = "androidx.navigation", name = "navigatio
 
 # Local JVM tests (pure Kotlin logic only; no Robolectric/emulator needed)
 junit = { group = "junit", name = "junit", version.ref = "junit" }
+
+# SAF document file access (lightweight wrapper around content URIs)
+androidx-documentfile = { group = "androidx.documentfile", name = "documentfile", version.ref = "documentFile" }
+
+# ML Kit on-device text recognition (Google Play Services variant; small APK footprint)
+mlkit-text-recognition = { group = "com.google.android.gms", name = "play-services-mlkit-text-recognition", version.ref = "mlKitTextRecognition" }
 
 # Room (local conversation database)
 androidx-room-runtime = { group = "androidx.room", name = "room-runtime", version.ref = "room" }
