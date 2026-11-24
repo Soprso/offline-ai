@@ -68,9 +68,15 @@ import com.soprso.dhurandharai.chat.MessageCopyPayload
 import com.soprso.dhurandharai.chat.ReportSubmissionUiState
 import com.soprso.dhurandharai.database.Message
 import com.soprso.dhurandharai.document.AttachmentMime
+import com.soprso.dhurandharai.document.AttachmentStatus
 import com.soprso.dhurandharai.document.DocumentAttachment
+import com.soprso.dhurandharai.document.DocumentStorage
 import com.soprso.dhurandharai.ui.screens.AttachmentComposer
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.SupervisorJob
 import java.io.File
 
 private val ExamplePrompts = listOf(
@@ -110,6 +116,7 @@ fun ChatScreen(
     val messageAttachments by viewModel.attachmentViewModel.attachments.collectAsState()
 
     val listState = rememberLazyListState()
+    val scope = remember { CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate) }
     val context = LocalContext.current
     val isDebugBuild = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
 
@@ -316,6 +323,11 @@ fun ChatScreen(
                             attachments = messageAttachments[msg.conversationId]?.filter { it.messageId == msg.id } ?: emptyList(),
                             onCopy = ::copyMessage,
                             onReport = { reportTarget = it },
+                            onRetry = { attachmentId ->
+                                scope.launch {
+                                    viewModel.attachmentViewModel.retryAttachment(attachmentId)
+                                }
+                            },
                         )
                     }
                     if (streamingText != null) {
@@ -694,6 +706,7 @@ private fun MessageRow(
     attachments: List<DocumentAttachment> = emptyList(),
     onCopy: (String) -> Unit,
     onReport: (Message) -> Unit,
+    onRetry: ((String) -> Unit)? = null,
 ) {
     val isUser = message.role == "user"
     var showActions by remember { mutableStateOf(false) }
@@ -718,12 +731,13 @@ private fun MessageRow(
             ),
         ) {
             Bubble(message.content, isUser = isUser)
-            if (attachments.isNotEmpty()) {
-                AttachmentStrip(
-                    attachments = attachments,
-                    isUser = isUser,
-                )
-            }
+        }
+        if (attachments.isNotEmpty()) {
+            AttachmentStrip(
+                attachments = attachments,
+                isUser = isUser,
+                onRetry = onRetry,
+            )
         }
         if (showActions) {
             Row(
@@ -927,6 +941,7 @@ private fun Composer(
 private fun AttachmentStrip(
     attachments: List<DocumentAttachment>,
     isUser: Boolean,
+    onRetry: ((String) -> Unit)? = null,
 ) {
     val color = if (isUser) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.surface
     Row(
@@ -937,7 +952,7 @@ private fun AttachmentStrip(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         attachments.forEach { att ->
-            MessageAttachmentChip(att, color)
+            MessageAttachmentChip(att, color, onRetry = onRetry?.let { { it(att.id) } })
         }
     }
 }
@@ -946,22 +961,32 @@ private fun AttachmentStrip(
 private fun MessageAttachmentChip(
     att: DocumentAttachment,
     backgroundColor: Color,
+    onRetry: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val isImage = att.mimeType.lowercase().startsWith("image/")
     val displayName = att.fileName.take(24)
     val typeLabel = att.mimeType.lowercase().takeIf { it.isNotEmpty() }?.substringAfterLast("/")?.uppercase()?.firstOrNull()?.toString() ?: "DOC"
     val chipText = if (isImage) "IMG" else typeLabel
+    val statusText = when (att.status) {
+        AttachmentStatus.Ready -> "✓"
+        AttachmentStatus.Failed -> "⚠️"
+        AttachmentStatus.Unsupported -> "❌"
+        AttachmentStatus.Processing, AttachmentStatus.ExtractingText, AttachmentStatus.ExtractingImages,
+        AttachmentStatus.RunningOcr, AttachmentStatus.PreparingContext, AttachmentStatus.PartiallyProcessed -> "⟳"
+        AttachmentStatus.Selected, AttachmentStatus.Saved, AttachmentStatus.VisionRequired -> "•"
+    }
 
     Row(
         modifier = Modifier
             .background(backgroundColor, RoundedCornerShape(6.dp))
             .padding(horizontal = 6.dp, vertical = 4.dp)
-            .size(width = 120.dp, height = 34.dp)
+            .size(width = 120.dp, height = 36.dp)
             .clickable {
-                att.localPath?.let { path ->
+                val file = DocumentStorage.resolvePath(context, att.localPath)
+                if (file != null && file.isFile) {
                     val intent = Intent(Intent.ACTION_VIEW).apply {
-                        setDataAndType(Uri.fromFile(File(path)), att.mimeType)
+                        setDataAndType(Uri.fromFile(file), att.mimeType)
                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     }
                     context.startActivity(intent)
@@ -976,11 +1001,20 @@ private fun MessageAttachmentChip(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Text(
-            text = displayName,
+            text = "$statusText $displayName",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurface,
             maxLines = 1,
             modifier = Modifier.weight(1f).padding(horizontal = 2.dp),
         )
+        if (att.status == AttachmentStatus.Failed && onRetry != null) {
+            IconButton(onClick = onRetry) {
+                Text(
+                    text = "↻",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
     }
 }

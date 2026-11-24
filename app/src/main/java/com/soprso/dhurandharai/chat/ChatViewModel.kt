@@ -226,19 +226,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             attachmentViewModel.linkAttachmentsToMessage(attachmentIds, messageId)
         }
 
-        // Build document context from just the attachments attached to THIS message.
-        val docContext = if (attachmentIds.isNotEmpty()) {
-            val msgAtts = attachmentViewModel.getAttachmentsForMessage(messageId)
-            attachmentViewModel.buildContextFromAttachments(msgAtts)
-        } else null
+        // Build document context from all ready attachments in conversation for follow-ups.
+        val docContext = attachmentViewModel.buildContextForConversation(conversationId)
+            .takeIf { it.isNotBlank() }
 
-        // Build generation messages: history + document context + user text.
-        generateReply(conversationId, text, docContext)
+        // Build generation messages: history already includes this user message.
+        generateReply(conversationId, docContext)
     }
 
     private suspend fun generateReply(
         conversationId: String,
-        userText: String,
         documentContext: String?,
     ) {
         if (!ModelEngine.isLoaded) {
@@ -247,17 +244,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val history = db.messageDao().getForConversation(conversationId)
-        val flat = ArrayList<String>(history.size * 2 + 2)
-        history.forEach {
-            flat.add(it.role)
-            flat.add(it.content)
+        val flat = ArrayList<String>(history.size * 2)
+        history.forEach { msg ->
+            flat.add(msg.role)
+            if (msg.role == "user" && msg.id == history.lastOrNull { it.role == "user" }?.id && !documentContext.isNullOrBlank()) {
+                flat.add("$documentContext\n\n--- USER MESSAGE ---\n${msg.content}")
+            } else {
+                flat.add(msg.content)
+            }
         }
-
-        // Prepend document context to the current user turn if available.
-        val userContent = if (documentContext.isNullOrBlank()) userText else "$documentContext\n\n--- USER MESSAGE ---\n$userText"
-
-        flat.add("user")
-        flat.add(userContent)
         if (flat.isEmpty()) return
 
         val modelName = currentModelName.value ?: "model"

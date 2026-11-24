@@ -35,13 +35,31 @@ enum class AttachmentCategory {
 
 /** Processing states for an attachment. */
 enum class AttachmentStatus {
-    Waiting, ExtractingText, ExtractingImages, RunningOcr, PreparingContext, Ready, Failed
+    Selected,
+    Saved,
+    Processing,
+    ExtractingText,
+    ExtractingImages,
+    RunningOcr,
+    PreparingContext,
+    Ready,
+    PartiallyProcessed,
+    Failed,
+    Unsupported,
+    VisionRequired,
 }
 
 data class AttachmentError(
     val code: String,
     val message: String,
     val recoverable: Boolean = true
+)
+
+data class AttachmentProcessingMetrics(
+    val extractedChars: Int = 0,
+    val ocrChars: Int = 0,
+    val pagesProcessed: Int = 0,
+    val contextChars: Int = 0,
 )
 
 /** Metadata for a single attached document. Stored in Room. */
@@ -61,7 +79,7 @@ data class DocumentAttachment(
     val localPath: String?,
     /** Thumbnail path for image attachments. */
     val thumbnailPath: String?,
-    val status: AttachmentStatus = AttachmentStatus.Waiting,
+    val status: AttachmentStatus = AttachmentStatus.Selected,
     val error: AttachmentError? = null,
     val progress: Float = 0f,
     /** Extracted text content. */

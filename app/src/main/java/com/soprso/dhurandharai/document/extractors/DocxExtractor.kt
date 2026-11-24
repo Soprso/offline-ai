@@ -5,21 +5,20 @@ import android.net.Uri
 import com.soprso.dhurandharai.document.DocumentMetadata
 import com.soprso.dhurandharai.document.AttachmentError
 import com.soprso.dhurandharai.document.AttachmentStatus
-import com.soprso.dhurandharai.document.DocumentStorage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.InputStream
 import java.util.zip.ZipFile
 import javax.xml.parsers.DocumentBuilderFactory
-import org.w3c.dom.Node
-import org.w3c.dom.NodeList
 
-/** Extracts text and embedded images from DOCX (WordprocessingML) files. */
+/** Extracts text and embedded image counts from DOCX (WordprocessingML) files. */
 class DocxExtractor(private val context: Context) {
 
     companion object {
         const val MAX_PARAGRAPHS = 2000
         const val MAX_TABLES = 100
+        const val MAX_ENTRY_BYTES = 4_000_000L
     }
 
     suspend fun extract(
@@ -27,11 +26,10 @@ class DocxExtractor(private val context: Context) {
         file: File?,
         attachment: DocumentMetadata,
     ): DocumentMetadata = withContext(Dispatchers.Default) {
-        val docxFile = file ?: File(localPathFor(uri, context) ?: return@withContext attachment.copy(
+        val docxFile = file ?: return@withContext attachment.copy(
             status = AttachmentStatus.Failed,
             error = AttachmentError("NO_LOCAL_FILE", "DOCX file is not available locally", true),
-        ))
-
+        )
         if (!docxFile.exists()) {
             return@withContext attachment.copy(
                 status = AttachmentStatus.Failed,
@@ -41,135 +39,124 @@ class DocxExtractor(private val context: Context) {
 
         val textBuilder = StringBuilder()
         var imageCount = 0
-        var paragraphCount = 0
-
-        ZipFile(docxFile).use { zip ->
-            // Extract text from document.xml
-            val documentEntry = zip.getEntry("word/document.xml")
-            if (documentEntry != null) {
-                zip.getInputStream(documentEntry).use { input ->
-                    val doc = DocumentBuilderFactory.newInstance()
-                        .newDocumentBuilder()
-                        .parse(input)
-                    val body = doc.getElementsByTagName("w:body").item(0)
-                    if (body != null) {
-                        processBody(body, textBuilder, MAX_PARAGRAPHS, MAX_TABLES)
-                        paragraphCount = countParagraphs(body)
+        try {
+            ZipFile(docxFile).use { zip ->
+                val documentEntry = zip.getEntry("word/document.xml")
+                if (documentEntry != null) {
+                    zip.getInputStream(documentEntry).use { input ->
+                        val doc = secureParse(input)
+                        val body = doc.getElementsByTagName("w:body").item(0)
+                        if (body != null) processBody(body, textBuilder, MAX_PARAGRAPHS, MAX_TABLES)
                     }
                 }
+                imageCount = countMediaEntries(zip, "word/media/")
             }
-
-            // Count embedded images in word/media/
-            imageCount = countMediaEntries(zip, "word/media/")
+        } catch (e: Exception) {
+            return@withContext attachment.copy(
+                status = AttachmentStatus.Failed,
+                error = AttachmentError("DOCX_PARSE_FAILED", "Unable to read DOCX: ${e.message ?: "unknown"}", true),
+            )
         }
 
         val extracted = textBuilder.toString().trim()
-
         attachment.copy(
             status = AttachmentStatus.Ready,
-            extractedText = if (extracted.isNotBlank()) extracted else null,
+            extractedText = extracted.ifBlank { null },
             pageCount = 1,
             imageCount = imageCount,
             processedAt = System.currentTimeMillis(),
         )
     }
 
-    private fun processBody(
-        node: Node,
-        sb: StringBuilder,
-        maxParagraphs: Int,
-        maxTables: Int,
-    ) {
+    private fun secureParse(input: InputStream) = DocumentBuilderFactory.newInstance().apply {
+        isNamespaceAware = false
+        setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+        setFeature("http://xml.org/sax/features/external-general-entities", false)
+        setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+        setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false)
+        isXIncludeAware = false
+        setExpandEntityReferences(false)
+    }.newDocumentBuilder().parse(input)
+
+    private fun processBody(node: org.w3c.dom.Node, sb: StringBuilder, maxParagraphs: Int, maxTables: Int) {
         var child = node.firstChild
         var paras = 0
         var tables = 0
-        while (child != null && paras < maxParagraphs && tables < maxTables) {
-            val name = child.nodeName
-            when {
-                name == "w:p" -> {
+        while (child != null && paras < maxParagraphs) {
+            when (child.nodeName) {
+                "w:p" -> {
                     val paraText = extractParagraphText(child)
-                    if (paraText.isNotBlank()) {
-                        sb.append(paraText).append("\n")
-                    }
+                    if (paraText.isNotBlank()) sb.append(paraText).append("\n")
                     paras++
                 }
-                name == "w:tbl" -> {
-                    sb.append("[TABLE]\n")
-                    val tableText = extractTableText(child)
-                    sb.append(tableText).append("\n[/TABLE]\n")
+                "w:tbl" -> {
+                    if (tables < maxTables) {
+                        sb.append("[TABLE]\n").append(extractTableText(child)).append("\n[/TABLE]\n")
+                    }
                     tables++
                 }
-                name == "w:sectPr" -> Unit // skip section properties
             }
             child = child.nextSibling
         }
-        if (paras >= maxParagraphs) {
-            sb.append("\n… [document truncated at $maxParagraphs paragraphs]")
-        }
-        if (tables >= maxTables) {
-            sb.append("\n… [table limit reached]")
-        }
+        if (paras >= maxParagraphs) sb.append("\n… [document truncated at $maxParagraphs paragraphs]\n")
+        if (tables > maxTables) sb.append("\n… [tables truncated at $maxTables]\n")
     }
 
-    private fun extractParagraphText(paragraph: Node): String {
+    private fun extractParagraphText(paragraph: org.w3c.dom.Node): String {
         val sb = StringBuilder()
-        var child = paragraph.firstChild
-        while (child != null) {
-            child?.let { current ->
-                if (current.nodeName == "w:r") { // run
-                    var tc = current.firstChild
-                    while (tc != null) {
-                        if (tc.nodeName == "w:t") {
-                            val text = tc.textContent
-                            if (text.isNotBlank()) sb.append(text)
-                        }
-                        tc = tc.nextSibling
-                    }
+        val runs = paragraph.childNodes
+        for (i in 0 until runs.length) {
+            val run = runs.item(i) ?: continue
+            if (run.nodeName != "w:r") continue
+            val children = run.childNodes
+            for (j in 0 until children.length) {
+                val n = children.item(j) ?: continue
+                if (n.nodeName == "w:t") sb.append(n.textContent)
+                if (n.nodeName == "w:tab") sb.append("\t")
+                if (n.nodeName == "w:br") sb.append("\n")
+            }
+        }
+        return sb.toString().trim()
+    }
+
+    private fun extractTableText(table: org.w3c.dom.Node): String {
+        val sb = StringBuilder()
+        val rows = table.childNodes
+        for (i in 0 until rows.length) {
+            val row = rows.item(i) ?: continue
+            if (row.nodeName != "w:tr") continue
+            val cells = row.childNodes
+            val cellTexts = mutableListOf<String>()
+            for (j in 0 until cells.length) {
+                val cell = cells.item(j) ?: continue
+                if (cell.nodeName != "w:tc") continue
+                cellTexts.add(extractParagraphsFromNode(cell))
+            }
+            if (cellTexts.isNotEmpty()) sb.append(cellTexts.joinToString(" | ")).append("\n")
+        }
+        return sb.toString().trim()
+    }
+
+    private fun extractParagraphsFromNode(node: org.w3c.dom.Node): String {
+        val sb = StringBuilder()
+        val children = node.childNodes
+        for (i in 0 until children.length) {
+            val child = children.item(i) ?: continue
+            if (child.nodeName == "w:p") {
+                val t = extractParagraphText(child)
+                if (t.isNotBlank()) {
+                    if (sb.isNotEmpty()) sb.append(' ')
+                    sb.append(t)
+                }
+            } else {
+                val nested = extractParagraphsFromNode(child)
+                if (nested.isNotBlank()) {
+                    if (sb.isNotEmpty()) sb.append(' ')
+                    sb.append(nested)
                 }
             }
-            child = child.nextSibling
         }
-        return sb.toString()
-    }
-
-    private fun extractTableText(table: Node): String {
-        val sb = StringBuilder()
-        var child = table.firstChild
-        while (child != null) {
-            child?.let { currentRow ->
-                if (currentRow.nodeName == "w:tr") { // table row
-                    var cell = currentRow.firstChild
-                    while (cell != null) {
-                        cell?.let { currentCell ->
-                            if (currentCell.nodeName == "w:tc") {
-                                var tc = currentCell.firstChild
-                                while (tc != null) {
-                                    if (tc.nodeName == "w:t") {
-                                        sb.append(tc.textContent)
-                                        sb.append(" | ")
-                                    }
-                                    tc = tc.nextSibling
-                                }
-                                sb.append("\n")
-                            }
-                        }
-                        cell = cell.nextSibling
-                    }
-                }
-            }
-            child = child.nextSibling
-        }
-        return sb.toString()
-    }
-
-    private fun countParagraphs(body: Node): Int {
-        var count = 0
-        var child = body.firstChild
-        while (child != null) {
-            if (child.nodeName == "w:p") count++
-            child = child.nextSibling
-        }
-        return count
+        return sb.toString().trim()
     }
 
     private fun countMediaEntries(zip: ZipFile, prefix: String): Int {
@@ -178,16 +165,13 @@ class DocxExtractor(private val context: Context) {
         while (entries.hasMoreElements()) {
             val entry = entries.nextElement()
             if (entry.name.startsWith(prefix) && !entry.isDirectory) {
+                if (entry.size > MAX_ENTRY_BYTES) continue
                 val lower = entry.name.lowercase()
-                if (lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".gif")) {
-                    count++
-                }
+                if (lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") ||
+                    lower.endsWith(".gif") || lower.endsWith(".webp")
+                ) count++
             }
         }
         return count
-    }
-
-    private fun localPathFor(uri: Uri?, context: Context): String? {
-        return null
     }
 }

@@ -43,7 +43,7 @@ object DocumentChunker {
         for (para in paragraphs) {
             val paraTokens = estimateTokens(para)
             if (paraTokens > MAX_CHUNK_TOKENS) {
-                val sentences = para.split(".".toRegex()).filter { it.isNotBlank() }
+                val sentences = para.split("\\.".toRegex()).filter { it.isNotBlank() }
                 for (sentence in sentences) {
                     val sentTokens = estimateTokens(sentence)
                     if (currentTokens + sentTokens > MAX_CHUNK_TOKENS && current.isNotEmpty()) {

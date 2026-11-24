@@ -22,30 +22,37 @@ class PageRenderer(private val context: Context) {
         pageIndex: Int,
         maxDimension: Int = 1024,
     ): Bitmap? = withContext(Dispatchers.Default) {
-        val fd = ParcelFileDescriptor.open(pdfFile, ParcelFileDescriptor.MODE_READ_ONLY)
-        PdfRenderer(fd).use { renderer ->
-            val pageCount = renderer.pageCount
-            if (pageIndex < 0 || pageIndex >= pageCount) {
-                return@withContext null
-            } else {
-                renderer.openPage(pageIndex).use { page ->
-                    val width = page.width
-                    val height = page.height
-                    val scale = maxDimension.toFloat() / max(width, height)
-                    val targetWidth = (width * scale).toInt().coerceAtLeast(1)
-                    val targetHeight = (height * scale).toInt().coerceAtLeast(1)
-                    val bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
-                    page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                    return@use bitmap
+        try {
+            ParcelFileDescriptor.open(pdfFile, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+                PdfRenderer(fd).use { renderer ->
+                    if (pageIndex < 0 || pageIndex >= renderer.pageCount) return@withContext null
+                    renderer.openPage(pageIndex).use { page ->
+                        val width = page.width
+                        val height = page.height
+                        val scale = maxDimension.toFloat() / max(width, height)
+                        val targetWidth = (width * scale).toInt().coerceAtLeast(1)
+                        val targetHeight = (height * scale).toInt().coerceAtLeast(1)
+                        val bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+                        bitmap.eraseColor(android.graphics.Color.WHITE)
+                        page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        bitmap
+                    }
                 }
             }
+        } catch (_: Exception) {
+            null
         }
     }
 
     /** Returns the number of pages in a PDF file. */
     suspend fun pageCount(pdfFile: File): Int = withContext(Dispatchers.Default) {
-        val fd = ParcelFileDescriptor.open(pdfFile, ParcelFileDescriptor.MODE_READ_ONLY)
-        PdfRenderer(fd).use { renderer -> renderer.pageCount }
+        try {
+            ParcelFileDescriptor.open(pdfFile, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+                PdfRenderer(fd).use { renderer -> renderer.pageCount }
+            }
+        } catch (_: Exception) {
+            0
+        }
     }
 
     /** Renders all pages of a PDF to the output directory, returning paths. */

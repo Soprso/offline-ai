@@ -11,14 +11,18 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
 
+data class DetailedOcrResult(
+    val text: String = "",
+    val blocks: Int = 0,
+    val lines: Int = 0,
+    val error: String? = null,
+)
+
 /**
  * On-device OCR using ML Kit Text Recognition (Latin).
  *
- * The recognition model is provided by Google Play Services (unbundled variant) and
- * downloaded once on first use; after that, recognition runs fully on-device and
- * offline. [isAvailable] reports whether the ML Kit client could be created on this
- * device. Per-image failures (model not yet available, decode error, no text) degrade
- * gracefully to an empty string rather than crashing.
+ * Uses Google Play Services unbundled model. Recognition runs on-device after
+ * model availability; if model is unavailable, callers receive an explicit error.
  */
 class OcrProcessor(private val context: Context) {
 
@@ -26,54 +30,66 @@ class OcrProcessor(private val context: Context) {
         TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     }
 
-    /** True when the ML Kit text recognizer is present on this device. */
+    /** True when the ML Kit text recognizer client can be created. */
     val isAvailable: Boolean
         get() = try {
             recognizer
             true
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             false
         }
 
-    /**
-     * Runs OCR on a bitmap and returns the recognized text (blocks/lines joined by
-     * newlines). Returns an empty string when OCR is unavailable, the bitmap is
-     * empty, or no text is found.
-     */
-    suspend fun recognizeText(bitmap: Bitmap): String = withContext(Dispatchers.Default) {
-        if (bitmap.width <= 0 || bitmap.height <= 0) return@withContext ""
-        val rotation = 0 // bitmaps are already EXIF-oriented by ImagePreprocessor
+    suspend fun recognizeDetailed(bitmap: Bitmap): DetailedOcrResult = withContext(Dispatchers.Default) {
+        if (bitmap.width <= 0 || bitmap.height <= 0) return@withContext DetailedOcrResult()
         val image = try {
-            InputImage.fromBitmap(bitmap, rotation)
+            InputImage.fromBitmap(bitmap, 0)
         } catch (e: Exception) {
-            return@withContext ""
+            return@withContext DetailedOcrResult(error = "OCR input image could not be created: ${e.message ?: "unknown"}")
         }
-
         suspendCancellableCoroutine { cont ->
             val task = recognizer.process(image)
             task.addOnSuccessListener { visionText ->
-                if (cont.isActive) cont.resume(visionText.text ?: "")
+                if (!cont.isActive) return@addOnSuccessListener
+                val blocks = visionText.textBlocks?.size ?: 0
+                val lines = visionText.textBlocks?.sumOf { it.lines.size } ?: 0
+                cont.resume(
+                    DetailedOcrResult(
+                        text = visionText.text.orEmpty(),
+                        blocks = blocks,
+                        lines = lines,
+                        error = null,
+                    )
+                )
             }
-            task.addOnFailureListener {
-                if (cont.isActive) cont.resume("")
+            task.addOnFailureListener { e ->
+                if (cont.isActive) {
+                    cont.resume(
+                        DetailedOcrResult(
+                            error = "OCR failed: ${e.message ?: e.javaClass.simpleName}",
+                        )
+                    )
+                }
             }
-            cont.invokeOnCancellation {
-                // The underlying Task has no cheap cancel hook; dropping the result is safe.
-            }
+            cont.invokeOnCancellation { }
         }
     }
 
     /**
+     * Runs OCR on a bitmap and returns recognized text. Empty string means no text
+     * or failure; prefer [recognizeDetailed] for status-aware flows.
+     */
+    suspend fun recognizeText(bitmap: Bitmap): String = recognizeDetailed(bitmap).text
+
+    /**
      * Runs OCR on multiple images and returns non-empty results keyed by image id.
-     * Images that fail or contain no text are skipped.
      */
     suspend fun recognizeBatch(images: Map<String, Bitmap>): List<OcrResult> =
         withContext(Dispatchers.Default) {
             val results = mutableListOf<OcrResult>()
             for ((id, bitmap) in images) {
-                val text = recognizeText(bitmap)
-                if (text.isNotBlank()) {
-                    results += OcrResult(imageId = id, text = text)
+                val detailed = recognizeDetailed(bitmap)
+                if (detailed.text.isNotBlank()) {
+                    results += OcrResult(imageId = id, text = detailed.text)
                 }
             }
             results

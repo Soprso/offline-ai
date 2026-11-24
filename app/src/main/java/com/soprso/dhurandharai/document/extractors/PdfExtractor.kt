@@ -1,13 +1,8 @@
 package com.soprso.dhurandharai.document.extractors
 
 import android.content.Context
-import android.graphics.Bitmap
 import android.net.Uri
-import com.soprso.dhurandharai.document.DocumentMetadata
-import com.soprso.dhurandharai.document.AttachmentError
-import com.soprso.dhurandharai.document.AttachmentStatus
-import com.soprso.dhurandharai.document.OcrResult
-import com.soprso.dhurandharai.document.DocumentStorage
+import com.soprso.dhurandharai.document.*
 import com.soprso.dhurandharai.document.vision.ImageExtractor
 import com.soprso.dhurandharai.document.vision.OcrProcessor
 import com.soprso.dhurandharai.document.vision.PageRenderer
@@ -15,7 +10,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 
-/** Extracts text from PDFs by rendering pages and running OCR (Level A). */
+/**
+ * PDF extraction with page-aware OCR fallback.
+ *
+ * Selectable-text extraction is attempted via PdfBox-Android when available on
+ * classpath; otherwise falls back to page rendering + OCR. This avoids adding a
+ * hard dependency before evaluating APK/maintenance impact in this environment.
+ */
 class PdfExtractor(
     private val context: Context,
     private val pageRenderer: PageRenderer,
@@ -24,8 +25,8 @@ class PdfExtractor(
 ) {
 
     companion object {
-        const val MAX_PAGES_OCR = 50
-        const val OCR_TEXT_THRESHOLD = 20 // chars per page below which we consider it "scanned"
+        const val MAX_PAGES = 50
+        const val MIN_SELECTABLE_CHARS_PER_PAGE = 20
     }
 
     suspend fun extract(
@@ -33,11 +34,10 @@ class PdfExtractor(
         file: File?,
         attachment: DocumentMetadata,
     ): DocumentMetadata = withContext(Dispatchers.Default) {
-        val pdfFile = file ?: File(localPathFor(uri, context) ?: return@withContext attachment.copy(
+        val pdfFile = file ?: return@withContext attachment.copy(
             status = AttachmentStatus.Failed,
             error = AttachmentError("NO_LOCAL_FILE", "PDF file is not available locally", true),
-        ))
-
+        )
         if (!pdfFile.exists()) {
             return@withContext attachment.copy(
                 status = AttachmentStatus.Failed,
@@ -46,49 +46,104 @@ class PdfExtractor(
         }
 
         val pageCount = pageRenderer.pageCount(pdfFile)
-        val pagesToProcess = pageCount.coerceAtMost(MAX_PAGES_OCR)
+        val pagesToProcess = pageCount.coerceAtMost(MAX_PAGES)
+        val selectable = extractSelectableTextByReflection(pdfFile, pagesToProcess)
 
-        val textBuilder = StringBuilder()
-        var totalOcrText = ""
-        var ocrResults = mutableListOf<OcrResult>()
+        val extracted = StringBuilder()
+        val ocr = StringBuilder()
+        var ocrPages = 0
+        var missingTextPages = 0
 
-        for (i in 0 until pagesToProcess) {
-            val bitmap = pageRenderer.renderPage(pdfFile, i, maxDimension = 1024)
-            if (bitmap != null) {
-                try {
-                    val pageText = ocrProcessor.recognizeText(bitmap)
-                    textBuilder.append("\n--- PAGE ${i + 1} ---\n")
-                    textBuilder.append(pageText)
-                    if (pageText.isNotBlank()) {
-                        ocrResults += OcrResult(
-                            imageId = "page_${i + 1}",
-                            text = pageText,
-                            pageNumber = i + 1,
-                        )
-                        totalOcrText += pageText + "\n"
+        for (pageIndex in 0 until pagesToProcess) {
+            val pageNo = pageIndex + 1
+            val pageText = selectable.getOrNull(pageIndex)?.trim().orEmpty()
+            val hasSelectable = pageText.length >= MIN_SELECTABLE_CHARS_PER_PAGE
+            if (hasSelectable) {
+                extracted.append("\n--- PAGE $pageNo ---\n").append(pageText).append("\n")
+                continue
+            }
+
+            // Scanned/empty page: render and OCR.
+            val bitmap = pageRenderer.renderPage(pdfFile, pageIndex, maxDimension = 1280)
+            if (bitmap == null) {
+                missingTextPages++
+                continue
+            }
+            try {
+                if (ocrProcessor.isAvailable) {
+                    val result = ocrProcessor.recognizeDetailed(bitmap)
+                    if (result.text.isNotBlank()) {
+                        ocr.append("\n--- PAGE $pageNo [OCR] ---\n").append(result.text.trim()).append("\n")
+                        ocrPages++
+                    } else if (result.error != null) {
+                        missingTextPages++
+                    } else {
+                        missingTextPages++
                     }
-                } finally {
-                    bitmap.recycle()
+                } else {
+                    missingTextPages++
                 }
+            } finally {
+                bitmap.recycle()
             }
         }
 
-        val extracted = textBuilder.toString().trim()
-        val hasUsableText = extracted.length > (pagesToProcess * OCR_TEXT_THRESHOLD)
+        val extractedText = extracted.toString().trim().ifBlank { null }
+        val ocrText = ocr.toString().trim().ifBlank { null }
+        val status = when {
+            extractedText != null && ocrText != null -> AttachmentStatus.Ready
+            extractedText != null -> AttachmentStatus.Ready
+            ocrText != null -> AttachmentStatus.Ready
+            pagesToProcess == 0 -> AttachmentStatus.Failed
+            !ocrProcessor.isAvailable -> AttachmentStatus.PartiallyProcessed
+            missingTextPages > 0 -> AttachmentStatus.PartiallyProcessed
+            else -> AttachmentStatus.PartiallyProcessed
+        }
+        val error = when {
+            status == AttachmentStatus.Failed -> AttachmentError("PDF_EMPTY", "PDF has no readable pages.", true)
+            status == AttachmentStatus.PartiallyProcessed && !ocrProcessor.isAvailable ->
+                AttachmentError("OCR_UNAVAILABLE", "PDF has pages without selectable text and OCR model is unavailable offline.", true)
+            status == AttachmentStatus.PartiallyProcessed && extractedText == null && ocrText == null ->
+                AttachmentError("NO_TEXT_FOUND", "No selectable text or OCR text was detected in processed PDF pages.", true)
+            else -> null
+        }
 
         attachment.copy(
-            status = AttachmentStatus.Ready,
-            extractedText = if (hasUsableText) extracted else null,
-            ocrText = totalOcrText.takeIf { it.isNotBlank() },
+            status = status,
+            extractedText = extractedText,
+            ocrText = ocrText,
             pageCount = pageCount,
+            imageCount = 0,
+            error = error,
             processedAt = System.currentTimeMillis(),
         )
     }
 
-    private fun localPathFor(uri: Uri?, context: Context): String? {
-        if (uri == null) return null
-        // For PDFs, we expect a local copy in DocumentStorage.originalsDir.
-        // The caller should have already copied the URI to local storage.
-        return null
+    /**
+     * Attempts PdfBox-Android text extraction via reflection so this build does
+     * not hard-fail when the dependency is absent. Returns empty list when unavailable.
+     */
+    private fun extractSelectableTextByReflection(pdfFile: File, pages: Int): List<String> {
+        return try {
+            val loaderClass = Class.forName("com.tom_roush.pdfbox.pdmodel.PDDocument")
+            val loadMethod = loaderClass.getMethod("load", File::class.java)
+            val doc = loadMethod.invoke(null, pdfFile)
+            try {
+                val stripperClass = Class.forName("com.tom_roush.pdfbox.text.PDFTextStripper")
+                val stripper = stripperClass.getDeclaredConstructor().newInstance()
+                val setStart = stripperClass.getMethod("setStartPage", Int::class.javaPrimitiveType)
+                val setEnd = stripperClass.getMethod("setEndPage", Int::class.javaPrimitiveType)
+                val getText = stripperClass.getMethod("getText", loaderClass)
+                (0 until pages).map { index ->
+                    setStart.invoke(stripper, index + 1)
+                    setEnd.invoke(stripper, index + 1)
+                    (getText.invoke(stripper, doc) as? String).orEmpty()
+                }
+            } finally {
+                loaderClass.getMethod("close").invoke(doc)
+            }
+        } catch (_: Throwable) {
+            emptyList()
+        }
     }
 }

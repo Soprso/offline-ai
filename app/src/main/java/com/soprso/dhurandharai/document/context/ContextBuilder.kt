@@ -1,14 +1,15 @@
 package com.soprso.dhurandharai.document.context
 
-/** Builds a structured context string from processed documents for the AI model. */
+/** Builds a structured, budget-bounded context string from processed documents for the AI model. */
 object ContextBuilder {
 
-    /** Total token budget for document context (rough estimate). */
+    /** Total token budget for document context (rough estimate: ~4 chars per token). */
     const val MAX_CONTEXT_TOKENS = 2048
 
     /**
      * Builds a document context string from processed attachments.
-     * Respects [MAX_CONTEXT_TOKENS] by selecting the most relevant chunks first.
+     * Respects [maxTokens] by selecting chunks within budget. Marks sections clearly
+     * and never fabricates visual analysis.
      */
     fun buildContext(
         chunksByDoc: Map<String, List<DocumentChunk>>,
@@ -26,22 +27,24 @@ object ContextBuilder {
 
             var docTokens = 0
             for (chunk in chunks) {
-                if (docTokens + chunk.tokenEstimate + 50 > maxTokens - usedTokens) break
+                val chunkCost = chunk.tokenEstimate + buildChunkHeader(chunk).length / 4 + 5
+                if (usedTokens + chunkCost > maxTokens) break
                 val header = buildChunkHeader(chunk)
                 sb.append(header)
                 sb.append(chunk.text)
                 sb.append("\n")
-                docTokens += chunk.tokenEstimate + header.length / 4
+                docTokens += chunkCost
+                usedTokens += chunkCost
             }
 
-            usedTokens += docTokens
             if (usedTokens >= maxTokens) break
         }
 
         if (sb.isEmpty()) return ""
 
         sb.insert(0, "\n=== DOCUMENT CONTEXT ===\nThe following content was extracted from attached documents. " +
-            "Use it to answer the user's questions. Page references are provided where available.\n")
+            "Use it to answer the user's questions. Page references are provided where available. " +
+            "If information was not fully extracted, say so explicitly.\n")
         sb.append("\n=== END DOCUMENT CONTEXT ===\n")
 
         return sb.toString()

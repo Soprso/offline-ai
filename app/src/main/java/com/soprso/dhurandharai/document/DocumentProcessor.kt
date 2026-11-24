@@ -2,6 +2,7 @@ package com.soprso.dhurandharai.document
 
 import android.content.Context
 import android.net.Uri
+import android.util.Log
 import com.soprso.dhurandharai.document.extractors.*
 import com.soprso.dhurandharai.document.image.ImageFormat
 import com.soprso.dhurandharai.document.vision.*
@@ -30,28 +31,12 @@ class DocumentProcessor(
         mimeType: String,
         conversationId: String,
         messageId: String?,
+        onStatus: (suspend (DocumentAttachment) -> Unit)? = null,
     ): DocumentAttachment {
         val sizeBytes = sizeOfUri(uri) ?: 0L
         val attachmentId = UUID.randomUUID().toString()
         val category = AttachmentMime.category(mimeType)
 
-        // Images go to files/images/originals; documents stay in files/documents.
-        val localFile: File
-        val storedPath: String
-        if (category == AttachmentCategory.Image) {
-            localFile = storage.copyImageUriToLocal(
-                context = context,
-                uri = uri,
-                imageId = attachmentId,
-                extension = ImageFormat.extensionForMime(mimeType, fileName),
-            )
-            storedPath = storage.relativePath(context, localFile)
-        } else {
-            localFile = storage.copyUriToLocal(context, uri, fileName)
-            storedPath = localFile.absolutePath
-        }
-
-        // Build initial attachment record.
         var attachment = DocumentAttachment(
             id = attachmentId,
             conversationId = conversationId,
@@ -60,95 +45,205 @@ class DocumentProcessor(
             mimeType = mimeType,
             sizeBytes = sizeBytes,
             contentUri = uri.toString(),
-            localPath = storedPath,
+            localPath = null,
             thumbnailPath = null,
-            status = DocumentAttachmentStatus.Waiting,
+            status = AttachmentStatus.Selected,
+        )
+        onStatus?.invoke(attachment)
+
+        if (category == null) {
+            return attachment.copy(
+                status = AttachmentStatus.Unsupported,
+                error = AttachmentError("UNSUPPORTED_FORMAT", "Unsupported file type: $mimeType", false),
+                processedAt = System.currentTimeMillis(),
+            ).also { onStatus?.invoke(it) }
+        }
+
+        val localFile: File
+        val storedPath: String
+        try {
+            if (category == AttachmentCategory.Image) {
+                localFile = storage.copyImageUriToLocal(
+                    context = context,
+                    uri = uri,
+                    imageId = attachmentId,
+                    extension = ImageFormat.extensionForMime(mimeType, fileName),
+                )
+                storedPath = storage.relativePath(context, localFile)
+            } else {
+                localFile = storage.copyUriToLocal(context, uri, fileName)
+                storedPath = localFile.absolutePath
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Attachment $attachmentId copy failed", e)
+            return attachment.copy(
+                status = AttachmentStatus.Failed,
+                error = AttachmentError("COPY_FAILED", "Could not save attachment locally: ${e.message ?: "unknown error"}", true),
+                processedAt = System.currentTimeMillis(),
+            ).also { onStatus?.invoke(it) }
+        }
+
+        attachment = attachment.copy(
+            localPath = storedPath,
+            status = AttachmentStatus.Saved,
+        )
+        onStatus?.invoke(attachment)
+
+        attachment = when (category) {
+            AttachmentCategory.Image -> processImage(attachment, localFile, onStatus)
+            else -> processDocument(attachment, localFile, uri, mimeType, onStatus)
+        }
+
+        val finalAttachment = attachment.copy(processedAt = System.currentTimeMillis())
+        Log.i(
+            TAG,
+            "attachment=${finalAttachment.id} stage=complete status=${finalAttachment.status} " +
+                "chars=${finalAttachment.extractedText?.length ?: 0} ocrChars=${finalAttachment.ocrText?.length ?: 0} " +
+                "pages=${finalAttachment.pageCount} images=${finalAttachment.imageCount}"
+        )
+        onStatus?.invoke(finalAttachment)
+        return finalAttachment
+    }
+
+    private suspend fun processImage(
+        attachment: DocumentAttachment,
+        localFile: File,
+        onStatus: (suspend (DocumentAttachment) -> Unit)?,
+    ): DocumentAttachment {
+        var current = attachment.copy(status = AttachmentStatus.ExtractingImages)
+        onStatus?.invoke(current)
+
+        val extracted = imageExtractor.processStoredImage(localFile, current.id)
+        if (extracted == null) {
+            DocumentStorage.deletePath(context, current.localPath)
+            return current.copy(
+                status = AttachmentStatus.Failed,
+                localPath = null,
+                thumbnailPath = null,
+                error = AttachmentError("INVALID_IMAGE", "The selected file is not a readable image.", true),
+            )
+        }
+
+        current = current.copy(
+            imageCount = 1,
+            pageCount = 1,
+            thumbnailPath = extracted.thumbnailPath,
+            width = extracted.width,
+            height = extracted.height,
         )
 
-        when (category) {
-            AttachmentCategory.Image -> {
-                attachment = attachment.copy(status = DocumentAttachmentStatus.ExtractingImages)
-                val extracted = imageExtractor.processStoredImage(localFile, attachment.id)
-                if (extracted == null) {
-                    storage.deletePath(context, storedPath)
-                    attachment = attachment.copy(
-                        status = DocumentAttachmentStatus.Failed,
-                        error = AttachmentError(
-                            "INVALID_IMAGE",
-                            "The selected file is not a readable image.",
-                            true,
-                        ),
-                    )
-                    return attachment.copy(processedAt = System.currentTimeMillis())
-                }
+        if (!ocrProcessor.isAvailable) {
+            return current.copy(
+                status = AttachmentStatus.PartiallyProcessed,
+                error = AttachmentError(
+                    "OCR_UNAVAILABLE",
+                    "OCR model is not available offline on this device. Image saved without text extraction.",
+                    true,
+                ),
+            )
+        }
 
-                attachment = attachment.copy(
-                    status = DocumentAttachmentStatus.Ready,
-                    imageCount = 1,
-                    extractedText = null,
-                    pageCount = 1,
-                    thumbnailPath = extracted.thumbnailPath,
-                    width = extracted.width,
-                    height = extracted.height,
-                    processedAt = System.currentTimeMillis(),
+        current = current.copy(status = AttachmentStatus.RunningOcr)
+        onStatus?.invoke(current)
+        val bitmap = ImagePreprocessor.decodeSampledBitmap(context = context, uri = null, file = localFile)
+        if (bitmap == null) {
+            return current.copy(
+                status = AttachmentStatus.PartiallyProcessed,
+                error = AttachmentError("IMAGE_DECODE_FAILED", "Image could not be decoded for OCR.", true),
+            )
+        }
+        try {
+            val ocr = ocrProcessor.recognizeDetailed(bitmap)
+            current = when {
+                ocr.error != null -> current.copy(
+                    status = AttachmentStatus.PartiallyProcessed,
+                    error = AttachmentError("OCR_FAILED", ocr.error, true),
                 )
-                // Run OCR on the image if available.
-                if (ocrProcessor.isAvailable) {
-                    attachment = attachment.copy(status = DocumentAttachmentStatus.RunningOcr)
-                    val bitmap = ImagePreprocessor.decodeSampledBitmap(
-                        context = context,
-                        uri = null,
-                        file = localFile,
-                    )
-                    if (bitmap != null) {
-                        try {
-                            val ocrText = ocrProcessor.recognizeText(bitmap)
-                            attachment = attachment.copy(
-                                ocrText = if (ocrText.isNotBlank()) ocrText else null,
-                                status = DocumentAttachmentStatus.Ready,
-                            )
-                        } finally {
-                            ImagePreprocessor.recycle(bitmap)
-                        }
-                    }
-                }
+                ocr.text.isNotBlank() -> current.copy(
+                    status = AttachmentStatus.Ready,
+                    ocrText = ocr.text,
+                    error = null,
+                )
+                else -> current.copy(
+                    status = AttachmentStatus.Ready,
+                    ocrText = null,
+                    error = null,
+                )
             }
+        } finally {
+            ImagePreprocessor.recycle(bitmap)
+        }
+        return current
+    }
 
-            else -> {
-                val extractor = router.route(mimeType)
-                if (extractor == null) {
-                attachment = attachment.copy(
-                    status = DocumentAttachmentStatus.Failed,
-                    error = AttachmentError("UNSUPPORTED_FORMAT", "No extractor for MIME type $mimeType", false),
-                )
+    private suspend fun processDocument(
+        attachment: DocumentAttachment,
+        localFile: File,
+        uri: Uri,
+        mimeType: String,
+        onStatus: (suspend (DocumentAttachment) -> Unit)?,
+    ): DocumentAttachment {
+        val extractor = router.route(mimeType)
+            ?: return attachment.copy(
+                status = AttachmentStatus.Unsupported,
+                error = AttachmentError("UNSUPPORTED_FORMAT", "No extractor for MIME type $mimeType", false),
+            )
+
+        var current = attachment.copy(status = AttachmentStatus.ExtractingText)
+        onStatus?.invoke(current)
+        current = try {
+            extractor(uri, localFile, current)
+        } catch (e: Exception) {
+            Log.w(TAG, "Attachment ${attachment.id} extraction failed", e)
+            current.copy(
+                status = AttachmentStatus.Failed,
+                error = AttachmentError("EXTRACTION_FAILED", "Unable to read this file: ${e.message ?: "unknown error"}", true),
+            )
+        }
+
+        // PDF fallback OCR when no selectable text was extracted.
+        if (mimeType.lowercase() == AttachmentMime.PDF &&
+            current.status != AttachmentStatus.Failed &&
+            current.extractedText.isNullOrBlank()
+        ) {
+            if (ocrProcessor.isAvailable) {
+                current = current.copy(status = AttachmentStatus.RunningOcr)
+                onStatus?.invoke(current)
+                val ocrText = ocrScannedPdf(localFile)
+                current = if (ocrText.isNotBlank()) {
+                    current.copy(status = AttachmentStatus.Ready, ocrText = ocrText, error = null)
                 } else {
-                    attachment = attachment.copy(status = DocumentAttachmentStatus.ExtractingText)
-                    attachment = extractor(uri, localFile, attachment)
-
-                    // For PDFs, also run OCR on pages if text extraction was poor.
-                    if (mimeType.lowercase() == AttachmentMime.PDF && ocrProcessor.isAvailable) {
-                        attachment = attachment.copy(status = DocumentAttachmentStatus.RunningOcr)
-                        val ocrText = attachment.ocrText
-                        if (ocrText.isNullOrBlank() && attachment.extractedText?.isBlank() == true) {
-                            // Try OCR on first few pages as fallback
-                            val firstPageBitmap = pageRenderer.renderPage(localFile, 0, maxDimension = 1024)
-                            if (firstPageBitmap != null) {
-                                try {
-                                    val fallbackText = ocrProcessor.recognizeText(firstPageBitmap)
-                                    attachment = attachment.copy(
-                                        ocrText = if (fallbackText.isNotBlank()) fallbackText else null,
-                                    )
-                                } finally {
-                                    ImagePreprocessor.recycle(firstPageBitmap)
-                                }
-                            }
-                        }
-                    }
+                    current.copy(
+                        status = AttachmentStatus.PartiallyProcessed,
+                        error = AttachmentError("NO_TEXT_FOUND", "No selectable text or OCR text was detected in this PDF.", true),
+                    )
                 }
+            } else {
+                current = current.copy(
+                    status = AttachmentStatus.PartiallyProcessed,
+                    error = AttachmentError("OCR_UNAVAILABLE", "PDF has no selectable text and OCR model is unavailable offline.", true),
+                )
             }
         }
 
-        return attachment.copy(processedAt = System.currentTimeMillis())
+        return current
+    }
+
+    private suspend fun ocrScannedPdf(pdfFile: File): String {
+        val pageCount = pageRenderer.pageCount(pdfFile).coerceAtMost(20)
+        val sb = StringBuilder()
+        for (i in 0 until pageCount) {
+            val bitmap = pageRenderer.renderPage(pdfFile, i, maxDimension = 1024) ?: continue
+            try {
+                val result = ocrProcessor.recognizeDetailed(bitmap)
+                if (result.text.isNotBlank()) {
+                    sb.append("\n--- PAGE ${i + 1} ---\n").append(result.text)
+                }
+            } finally {
+                ImagePreprocessor.recycle(bitmap)
+            }
+        }
+        return sb.toString().trim()
     }
 
     private fun sizeOfUri(uri: Uri): Long? {
@@ -163,15 +258,14 @@ class DocumentProcessor(
                 if (cursor.moveToFirst()) {
                     val idx = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
                     if (idx >= 0) cursor.getLong(idx) else null
-                } else {
-                    null
-                }
-            } ?: null
-        } catch (e: Exception) {
+                } else null
+            }
+        } catch (_: Exception) {
             null
         }
     }
-}
 
-/** Alias for AttachmentStatus to avoid confusion in processor. */
-private typealias DocumentAttachmentStatus = AttachmentStatus
+    companion object {
+        private const val TAG = "DocumentProcessor"
+    }
+}

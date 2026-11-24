@@ -118,16 +118,55 @@ class AttachmentViewModel(application: Application) : AndroidViewModel(applicati
                 mimeType = mimeType,
                 conversationId = conversationId,
                 messageId = messageId,
+                onStatus = { intermediate ->
+                    dao.insert(domainToEntity(intermediate))
+                    updateInMemory(intermediate)
+                },
             )
             newIds += att.id
-            val entity = domainToEntity(att)
-            dao.insert(entity)
-
-            val map = _attachments.value
-            val existing = map[conversationId] ?: emptyList()
-            _attachments.value = map + (conversationId to (existing + att))
+            dao.insert(domainToEntity(att))
+            updateInMemory(att)
         }
         return newIds
+    }
+
+    private fun updateInMemory(att: DocumentAttachment) {
+        val map = _attachments.value
+        val existing = (map[att.conversationId] ?: emptyList()).toMutableList()
+        val idx = existing.indexOfFirst { it.id == att.id }
+        if (idx >= 0) existing[idx] = att else existing.add(att)
+        _attachments.value = map + (att.conversationId to existing)
+    }
+
+    /** Retry processing for a failed/partial attachment. */
+    suspend fun retryAttachment(attachmentId: String): DocumentAttachment? {
+        val entity = dao.getById(attachmentId) ?: return null
+        val local = DocumentStorage.resolvePath(app, entity.localPath)
+        if (local == null || !local.exists()) {
+            val failed = entityToDomain(entity).copy(
+                status = AttachmentStatus.Failed,
+                error = AttachmentError("FILE_MISSING", "Local attachment file is missing. Please reattach.", false),
+            )
+            dao.update(domainToEntity(failed))
+            updateInMemory(failed)
+            return failed
+        }
+        val uri = Uri.fromFile(local)
+        val reprocessed = processor.processAttachment(
+            uri = uri,
+            fileName = entity.fileName,
+            mimeType = entity.mimeType,
+            conversationId = entity.conversationId,
+            messageId = entity.messageId,
+            onStatus = { intermediate ->
+                val withId = intermediate.copy(id = entity.id, localPath = entity.localPath, contentUri = entity.contentUri)
+                dao.update(domainToEntity(withId))
+                updateInMemory(withId)
+            },
+        ).copy(id = entity.id, createdAt = entity.createdAt, contentUri = entity.contentUri)
+        dao.update(domainToEntity(reprocessed))
+        updateInMemory(reprocessed)
+        return reprocessed
     }
 
     /** Links previously added attachments to a specific message ID. */
